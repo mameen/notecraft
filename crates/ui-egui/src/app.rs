@@ -502,6 +502,10 @@ struct PendingFormat {
     strike: bool,
     underline: bool,
     script: Option<notecraft_formats::markdown::Script>,
+    /// Font Colour and Text Highlight Colour chosen at the caret (#260). The outer `Some`
+    /// means one was chosen; Automatic and No Colour add nothing to new words.
+    colour: Option<Option<String>>,
+    highlight: Option<Option<String>>,
 }
 
 struct Editor {
@@ -667,6 +671,8 @@ impl Editor {
             strike: pending.strike,
             underline: pending.underline,
             script: pending.script,
+            colour: pending.colour.flatten(),
+            highlight: pending.highlight.flatten(),
             ..Default::default()
         };
         let template = notecraft_formats::render::spans_to_markdown(&[span]);
@@ -850,6 +856,14 @@ enum Dialog {
         text: String,
         address: String,
         editing: bool,
+        first: bool,
+    },
+    /// Insert > Online Video: the address of a video to link to at the caret (issue #284).
+    OnlineVideo {
+        block: usize,
+        cell: Option<(usize, usize)>,
+        range: (usize, usize),
+        address: String,
         first: bool,
     },
     /// Insert > Table > Insert Table...: a table of any size up to the limits, typed in.
@@ -1093,6 +1107,16 @@ pub struct NoteCraftApp {
     page_scroll_strip: Option<egui::Rect>,
     /// True while Insert Space is in hand: the next drag on the page adds or takes away room.
     space_tool: bool,
+    /// Draw > Ruler is out on the page (issue #293). Where it lies is the ink layer's.
+    ruler: bool,
+    /// Draw > Automatic Shapes is on (issue #294). Kept in the settings.
+    auto_shapes: bool,
+    /// Draw > Ink Replay is showing (issue #295). Its progress is the ink layer's.
+    replaying: bool,
+    /// View > Tabs layout: the sections as tabs over the page (issues #268, #33). Kept.
+    tabs_layout: bool,
+    /// View > Immersive Reader, while it is open (issue #299).
+    reader: Option<crate::reader::Reader>,
     /// What the pointer does on the page (the Draw tab).
     pointer: ribbon::Pointer,
     /// The tools on the rack, as the owner has arranged them, and which is in hand. Both
@@ -1139,6 +1163,7 @@ pub struct NoteCraftApp {
     backstage: Option<&'static str>,
     /// File > Save a Copy as it is being filled in (issue #301).
     copy_choice: backstage::CopyChoice,
+    portable: crate::portable::Choice,
     /// Which pages the user has read, kept beside their settings (issue #291). Loaded the
     /// first time it is needed.
     read_state: Option<notecraft_store::read_state::ReadState>,
@@ -1199,6 +1224,8 @@ impl NoteCraftApp {
         let session_rules = session.settings.get("rule_lines").and_then(|v| ribbon::RuleLines::parse(&v)).unwrap_or_default();
         let session_hide_title = session.settings.get("hide_title").map(|v| v.trim() == "true").unwrap_or(false);
         let session_snap = session.settings.get("snap_to_grid").map(|v| v.trim() == "true").unwrap_or(false);
+        let session_auto_shapes = session.settings.get("auto_shapes").is_some_and(|v| v.trim() == "true");
+        let session_tabs_layout = session.settings.get("tabs_layout").is_some_and(|v| v.trim() == "true");
         let session_ribbon_collapsed = session.settings.get("ribbon_collapsed").map(|v| v.trim() == "true").unwrap_or(false);
         // Two columns in the side panel, the way OneNote separates the notebooks from the
         // pages. This is the product's default navigation layout; the one-tree view remains
@@ -1277,6 +1304,11 @@ impl NoteCraftApp {
             page_hbar: None,
             page_scroll_strip: None,
             space_tool: false,
+            ruler: false,
+            auto_shapes: session_auto_shapes,
+            replaying: false,
+            tabs_layout: session_tabs_layout,
+            reader: None,
             canvas_drag: None,
             typed_while_inking: Vec::new(),
             typed_wait: 0,
@@ -1302,6 +1334,7 @@ impl NoteCraftApp {
             keyboard_paste_requested: false,
             backstage: None,
             copy_choice: backstage::CopyChoice::default(),
+            portable: crate::portable::Choice::default(),
             read_state: None,
             unread: std::collections::HashSet::new(),
             unread_checked: None,
@@ -1460,6 +1493,7 @@ impl NoteCraftApp {
 
     /// Opens a File/backstage page for deterministic UI captures and integration harnesses.
     pub fn open_backstage_page(&mut self, page: &'static str) {
+        let _ = self.session.run("export.cancel", &Params::new());
         self.backstage = Some(page);
     }
 
@@ -1519,6 +1553,42 @@ impl NoteCraftApp {
     /// The size the whole window is drawn at, in percent of the system's own scale.
     pub fn ui_scale(&self) -> u16 {
         self.ui_scale
+    }
+
+    /// Saves the notebooks folder NoteCraft uses from the next start. `None` goes back to the
+    /// default folder. The current session keeps its folder until then.
+    pub fn save_notebooks_root(&mut self, folder: Option<&std::path::Path>) -> Result<(), String> {
+        let value = folder.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
+        self.session.settings.set("last_notebooks_root", &value).map_err(|error| error.to_string())
+    }
+
+    fn choose_default_notebooks_folder(&mut self) {
+        // The dialog opens where the notebooks are now, not in Documents.
+        let Some(picked) = pick_notebooks_folder(self.session.root()) else {
+            return;
+        };
+        self.apply_notebooks_root_choice(Some(&picked));
+    }
+
+    /// Moves NoteCraft to the chosen notebooks folder now, or to the default folder for this build
+    /// when `folder` is None, and remembers the choice for the next start.
+    fn apply_notebooks_root_choice(&mut self, folder: Option<&std::path::Path>) {
+        let target = folder.map_or_else(notecraft_store::settings::build_default_notebooks_dir, std::path::Path::to_path_buf);
+        if let Err(error) = self.save_notebooks_root(folder) {
+            let message = crate::i18n::format_message_id("ui.could_not_save_the_notebooks_folder_error", &[("error", &error)]);
+            self.complain(&message);
+            return;
+        }
+        if let Err(error) = self.session.set_root(&target) {
+            let error = error.to_string();
+            let message = crate::i18n::format_message_id("ui.could_not_open_the_notebooks_folder_error", &[("error", &error)]);
+            self.complain(&message);
+            return;
+        }
+        self.editor = None;
+        self.pad = None;
+        let shown = target.display().to_string();
+        self.say(crate::i18n::format_message_id("ui.notebooks_folder_changed", &[("folder", &shown)]));
     }
 
     /// Draws the whole window larger or smaller, for a screen where the system's own scale
@@ -1594,6 +1664,20 @@ impl NoteCraftApp {
             }
             self.open.insert(d.to_path_buf());
             parent = d.parent();
+        }
+    }
+
+    /// Draw > Ink Help (issue #296): the Welcome notebook's handwriting and drawing page, in
+    /// the interface language when the notebook has it and in English otherwise. Only opens a
+    /// page; the note that was open is not changed.
+    fn open_ink_help(&mut self) {
+        let notebooks: Vec<PathBuf> = self.open_notebooks().into_iter().map(|n| n.path).collect();
+        match drawing_help_page(&notebooks, &crate::i18n::current_code()) {
+            Some(page) => {
+                self.expand_to(&page);
+                self.open_page(&page);
+            }
+            None => self.say(crate::tl_id!("ui.ink_help_missing")),
         }
     }
 
@@ -1892,6 +1976,7 @@ impl NoteCraftApp {
             return true;
         }
         if self.backstage.is_some() {
+            let _ = self.session.run("export.cancel", &Params::new());
             self.backstage = None;
             return true;
         }
@@ -3570,6 +3655,15 @@ impl NoteCraftApp {
         // Save a Copy counts from the page that is open (issue #301).
         let mut copy = std::mem::take(&mut self.copy_choice);
         copy.here = self.editor.as_ref().map(|e| e.dir.clone());
+        let mut portable = std::mem::take(&mut self.portable);
+        if portable.selection.here != copy.here {
+            let _ = self.session.run("export.cancel", &Params::new());
+            portable.selection.result = None;
+            portable.downloaded = false;
+        }
+        portable.selection.here = copy.here.clone();
+        portable.download = self.file_downloads.is_some();
+        let mut export_acts = Vec::new();
         let tokens = self.tokens;
         let folder = self.shown(self.session.root());
         let recent = self.recent_notebooks();
@@ -3598,13 +3692,22 @@ impl NoteCraftApp {
                 self.ui_scale,
                 &update,
                 &mut copy,
+                &mut portable,
+                self.session.reviewed_export(),
+                &mut export_acts,
                 &tokens,
             );
         });
         for a in acts {
             match a {
-                backstage::Act::Close => self.backstage = None,
-                backstage::Act::Page(name) => self.backstage = Some(name),
+                backstage::Act::Close => {
+                    let _ = self.session.run("export.cancel", &Params::new());
+                    self.backstage = None;
+                }
+                backstage::Act::Page(name) => {
+                    let _ = self.session.run("export.cancel", &Params::new());
+                    self.backstage = Some(name);
+                }
                 backstage::Act::NewNotebook => {
                     self.backstage = None;
                     self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None });
@@ -3636,6 +3739,8 @@ impl NoteCraftApp {
                     self.set_ui_language(language);
                 }
                 backstage::Act::SetUiScale(percent) => self.set_ui_scale(percent),
+                backstage::Act::ChooseNotebooksFolder => self.choose_default_notebooks_folder(),
+                backstage::Act::UseDefaultNotebooksFolder => self.apply_notebooks_root_choice(None),
                 backstage::Act::OpenTelemetryFolder(path) => {
                     // The folder is made on first use: it does not exist until a session has
                     // written to it, and Explorer opens Documents for a folder it cannot find.
@@ -3682,7 +3787,74 @@ impl NoteCraftApp {
                 }
             }
         }
+        for act in export_acts {
+            match act {
+                crate::portable::Act::Cancel => {
+                    let _ = self.session.run("export.cancel", &Params::new());
+                }
+                crate::portable::Act::ChooseFolder => {
+                    if let Some(folder) = pick_copy_folder() {
+                        portable.selection.folder = path_str(&folder);
+                    }
+                }
+                crate::portable::Act::Review(node) => {
+                    portable.selection.result = None;
+                    portable.downloaded = false;
+                    let p = self.export_snapshot_params(&node);
+                    if let Err(e) = self.session.run("export.prepare", &p) {
+                        portable.selection.result = Some(Err(e.to_string()));
+                    }
+                }
+                crate::portable::Act::Write => {
+                    if let Some(downloads) = self.file_downloads.as_mut() {
+                        if let Some(prepared) = self.session.reviewed_export() {
+                            match crate::portable::archive(prepared) {
+                                Ok(bytes) => {
+                                    downloads.push(FileDownload {
+                                        name: format!("{}-export.zip", prepared.notebook_name()),
+                                        mime: "application/zip",
+                                        bytes,
+                                    });
+                                    portable.downloaded = true;
+                                }
+                                Err(e) => portable.selection.result = Some(Err(e.to_string())),
+                            }
+                        }
+                    } else {
+                        portable.selection.result =
+                            Some(match self.session.run("export.write", &params(&[("folder", portable.selection.folder.trim())])) {
+                                Ok(Output::Path(path)) => Ok(path),
+                                Ok(_) => Err(crate::tl_id!("ui.portable_no_snapshot").to_string()),
+                                Err(e) => Err(e.to_string()),
+                            });
+                    }
+                }
+                crate::portable::Act::Reveal(path) => self.reveal(&path),
+            }
+        }
+        self.portable = portable;
         self.copy_choice = copy;
+    }
+
+    /// The current editor contributes text and live ink without a source save. Explicit
+    /// export commands and the three UI entry points use the same snapshot boundary.
+    fn export_snapshot_params(&self, node: &Path) -> Params {
+        let mut p = params(&[("path", &path_str(node))]);
+        if let Some(ed) = self.editor.as_ref().filter(|ed| ed.dir.starts_with(node)) {
+            p.insert("snapshot_path".into(), path_str(&ed.dir));
+            let mut body = ed.body_to_save();
+            if let Some(pad) = self.pad.as_ref().filter(|pad| pad.dirty) {
+                p.insert("ink".into(), notecraft_ink::svg::write(&pad.drawing, notecraft_ink::svg::Flavour::Editable));
+                if !notecraft_formats::references::in_text(ed.format, &body).iter().any(|r| r.target == "ink.svg") {
+                    body.push_str(match ed.format {
+                        PageFormat::Html => "\n<img src=\"ink.svg\" alt=\"Ink\">\n",
+                        PageFormat::Cmgfm => "\n\n![Ink](ink.svg)\n",
+                    });
+                }
+            }
+            p.insert("body".into(), body);
+        }
+        p
     }
 
     fn recent_notebooks(&self) -> Vec<Node> {
@@ -4069,6 +4241,10 @@ impl NoteCraftApp {
             nib: self.nib,
             in_table: self.caret_in_table(),
             space_tool: self.space_tool,
+            ruler: self.ruler,
+            auto_shapes: self.auto_shapes,
+            replaying: self.replaying,
+            tabs_layout: self.tabs_layout,
             table_borders: self.caret_table_has_borders(),
             table_align: self.caret_cells_align(),
             table_shade: self.caret_cells_shade(),
@@ -4088,6 +4264,14 @@ impl NoteCraftApp {
             font_family: family.as_deref(),
             font_size: size.as_deref(),
             marks: font_selection.marks,
+            text_colour: match &font_selection.colour {
+                pageedit::FontValue::Value(v) => Some(v.as_deref()),
+                _ => None,
+            },
+            text_highlight: match &font_selection.highlight {
+                pageedit::FontValue::Value(v) => Some(v.as_deref()),
+                _ => None,
+            },
         };
         let format = self.editor.as_ref().map(|e| e.format);
         let mut acts = Vec::new();
@@ -4355,6 +4539,13 @@ impl NoteCraftApp {
     fn ribbon_act(&mut self, act: ribbon::Act) {
         match act {
             ribbon::Act::File => self.backstage = Some("Info"),
+            ribbon::Act::SendPage => {
+                let _ = self.session.run("export.cancel", &Params::new());
+                self.portable.selection.scope = backstage::CopyScope::Page;
+                self.portable.selection.result = None;
+                self.portable.downloaded = false;
+                self.backstage = Some("Share");
+            }
             ribbon::Act::NextUnread => self.next_unread(),
             ribbon::Act::ToggleRead => self.toggle_read(),
             ribbon::Act::RecentEdits => self.show_recent_edits(RecentRange::Week, false),
@@ -4387,6 +4578,8 @@ impl NoteCraftApp {
             ribbon::Act::ToggleRibbon => self.toggle_ribbon(),
             ribbon::Act::Mark(mark) => self.apply_mark(mark),
             ribbon::Act::FontSize(size) => self.apply_font_size(size),
+            ribbon::Act::TextColour(colour) => self.apply_text_colour(pageedit::InlineFormat::Colour(colour)),
+            ribbon::Act::TextHighlight(colour) => self.apply_text_colour(pageedit::InlineFormat::Highlight(colour)),
             ribbon::Act::FontFamily(family) => self.apply_font_family(&family),
             ribbon::Act::Block(kind) => self.apply_block_kind(kind),
             ribbon::Act::Insert(what) => match what {
@@ -4413,6 +4606,7 @@ impl NoteCraftApp {
                     self.save_block_marks(marks);
                 }
                 "link" => self.open_link_dialog(),
+                "online-video" => self.open_online_video_dialog(),
                 "equation" => self.insert_in_page("$E = mc^2$"),
                 "date" | "time" | "datetime" => {
                     let now = notecraft_model::time::iso_now();
@@ -4539,6 +4733,35 @@ impl NoteCraftApp {
             }
             ribbon::Act::CustomizeTags => {
                 self.custom_tags = Some(crate::customtags::Dialog::new(notecraft_model::tag::custom()));
+            }
+            ribbon::Act::InkHelp => self.open_ink_help(),
+            ribbon::Act::ImmersiveReader => match self.editor.as_ref() {
+                Some(ed) => self.reader = Some(crate::reader::Reader::new(&ed.title_buf, &ed.blocks, !ed.ink_files.is_empty())),
+                None => self.say(crate::tl_id!("ui.reader_open_a_page")),
+            },
+            ribbon::Act::ToggleTabsLayout => {
+                self.tabs_layout = !self.tabs_layout;
+                let _ = self.session.settings.set("tabs_layout", if self.tabs_layout { "true" } else { "false" });
+                self.say(if self.tabs_layout { crate::tl_id!("ui.tabs_layout_on") } else { crate::tl_id!("ui.tabs_layout_off") });
+            }
+            ribbon::Act::ToggleReplay => {
+                if !self.replaying && self.pad.as_ref().is_none_or(crate::inkpad::Pad::is_empty) {
+                    self.say(crate::tl_id!("ui.replay_nothing_to_replay"));
+                } else {
+                    self.replaying = !self.replaying;
+                }
+            }
+            ribbon::Act::ToggleAutoShapes => {
+                self.auto_shapes = !self.auto_shapes;
+                let _ = self.session.settings.set("auto_shapes", if self.auto_shapes { "true" } else { "false" });
+                self.say(if self.auto_shapes { crate::tl_id!("ui.automatic_shapes_on") } else { crate::tl_id!("ui.automatic_shapes_off") });
+            }
+            ribbon::Act::ToggleRuler => {
+                self.ruler = !self.ruler;
+                // The ruler is for drawing: with the caret in hand, the pen last used comes up.
+                if self.ruler && self.pointer == ribbon::Pointer::Write {
+                    self.ribbon_act(ribbon::Act::InkPen(self.nib));
+                }
             }
             ribbon::Act::CollectAll => {
                 if self.editor.as_ref().is_none_or(|ed| !ed.writable) {
@@ -4858,6 +5081,7 @@ impl NoteCraftApp {
             // control reach the same four-times full-width range as the pressure canvas.
             width: nib.width() * Self::sensitivity_width(self.sensitivity),
             gain: self.gain(),
+            auto_shapes: self.auto_shapes,
         }
     }
 
@@ -6189,6 +6413,41 @@ impl NoteCraftApp {
         self.status_is_error = false;
     }
 
+    /// Home > Font Colour and Text Highlight Colour (issue #260): to the selected words, as
+    /// font size does; with no selection, to what is typed next at the caret.
+    fn apply_text_colour(&mut self, format: pageedit::InlineFormat) {
+        if self.editor.as_ref().and_then(|ed| ed.across).is_some_and(|selection| !selection.inside_one_block()) {
+            self.apply_across_format(format);
+            return;
+        }
+        let Some(ed) = self.editor.as_mut() else { return };
+        Self::place_caret_for_format(ed);
+        let Some(caret) = ed.caret.as_ref() else {
+            self.status = crate::tl_id!("ui.click_in_the_page_first_then_use_the_ribbon").into();
+            self.status_is_error = false;
+            return;
+        };
+        if caret.selection.0 == caret.selection.1 {
+            let pending = ed.pending_format.get_or_insert_with(|| PendingFormat { block: caret.block, at: caret.selection.0, ..Default::default() });
+            if pending.block != caret.block || pending.at != caret.selection.0 {
+                *pending = PendingFormat { block: caret.block, at: caret.selection.0, ..Default::default() };
+            }
+            match format {
+                pageedit::InlineFormat::Colour(c) => pending.colour = Some(c),
+                pageedit::InlineFormat::Highlight(c) => pending.highlight = Some(c),
+                _ => {}
+            }
+            if let Some(caret) = ed.caret.as_mut() {
+                caret.focus = true;
+                caret.place = Some(caret.selection.0);
+            }
+            self.status.clear();
+            self.status_is_error = false;
+            return;
+        }
+        self.apply_partial_inline_format(format);
+    }
+
     fn apply_font_size(&mut self, size: u8) {
         if !ribbon::FONT_SIZES.contains(&size) {
             log::warn!("ribbon requested unsupported font size {size} pt");
@@ -6578,7 +6837,14 @@ impl NoteCraftApp {
             return;
         };
         let at = caret.block;
-        if !pageedit::set_kind(&mut ed.blocks, at, kind) {
+        // A style on a line of a code block applies to that line only: the block splits around it.
+        let line = caret.text.get(..caret.selection.1.min(caret.text.len())).map_or(0, |t| t.matches('\n').count());
+        let in_code = matches!(ed.blocks.get(at), Some(notecraft_formats::markdown::Block::Code { .. }));
+        if in_code && !matches!(kind, "codeblock" | "codenumbers") {
+            if !pageedit::split_code_line(&mut ed.blocks, at, line, kind) {
+                return;
+            }
+        } else if !pageedit::set_kind(&mut ed.blocks, at, kind) {
             return;
         }
         ed.rebuild_body();
@@ -6840,6 +7106,26 @@ impl NoteCraftApp {
             None => ((lo, hi), caret.text.chars().skip(lo).take(hi - lo).collect(), String::new(), false),
         };
         self.dialog = Some(Dialog::Link { block: caret.block, cell: caret.cell, range, text, address, editing, first: true });
+    }
+
+    /// Opens Insert > Online Video (issue #284): the video goes in at the caret, in place of
+    /// any words selected in one line.
+    pub fn open_online_video_dialog(&mut self) {
+        let Some(ed) = self.editor.as_mut().filter(|ed| ed.writable) else {
+            self.say(crate::tl_id!("ui.open_a_page_first"));
+            return;
+        };
+        if ed.across.is_some_and(|a| !a.inside_one_block()) {
+            self.say(crate::tl_id!("ui.select_words_in_one_line_for_a_link"));
+            return;
+        }
+        Self::place_caret_for_format(ed);
+        let Some(caret) = ed.caret.as_ref() else {
+            self.say(crate::tl_id!("ui.click_in_the_page_first_then_use_the_ribbon"));
+            return;
+        };
+        let range = (caret.selection.0.min(caret.selection.1), caret.selection.0.max(caret.selection.1));
+        self.dialog = Some(Dialog::OnlineVideo { block: caret.block, cell: caret.cell, range, address: String::new(), first: true });
     }
 
     /// Puts `replacement` in place of the characters `range` of the caret's line, when the
@@ -7662,6 +7948,36 @@ impl NoteCraftApp {
         }
     }
 
+    /// View > Tabs layout (issues #268, #33): the open notebook's sections as tabs over the
+    /// page. Choosing one opens its first page.
+    fn section_tabs(&mut self, ui: &mut Ui) {
+        if !self.tabs_layout || self.compact {
+            return;
+        }
+        let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone()) else { return };
+        let notebooks = self.open_notebooks();
+        let Some(notebook) = notebook_for(&dir).and_then(|nb| notebooks.iter().find(|n| n.path == nb)) else { return };
+        let tabs = crate::sectiontabs::tabs(notebook);
+        let here = section_for(&dir);
+        let tokens = self.tokens;
+        let mut chosen = None;
+        egui::Panel::top("section-tabs")
+            .frame(egui::Frame::NONE.fill(tokens.panel).inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 0 }))
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                chosen = crate::sectiontabs::show(ui, &tabs, here.as_deref(), &tokens);
+            });
+        if let Some(section) = chosen {
+            match first_page_under(&notebooks, &section) {
+                Some(page) => {
+                    self.expand_to(&page);
+                    self.open_page(&page);
+                }
+                None => self.say(crate::tl_id!("ui.this_section_has_no_pages_yet")),
+            }
+        }
+    }
+
     fn central(&mut self, ui: &mut Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
             if self.editor.is_none() {
@@ -7801,6 +8117,8 @@ impl NoteCraftApp {
         let (pen, pressure) = (self.pen(), self.stylus.sample().pressure);
         let mut pad = self.pad.take();
         let mut ink_changed = false;
+        // What Automatic Shapes made of a stroke this frame, to say after the save (#294).
+        let mut recognised: Option<&'static str> = None;
         let mut page_rect = None;
         let mut hbar = crate::hscroll::Shown::default();
         // What the page's right-click menu asked for, run once the page's borrow is over.
@@ -7936,7 +8254,15 @@ impl NoteCraftApp {
                                     .filter(|bar| bar.min.x > ink_area.min.x)
                                     .map_or(ink_area, |bar| ink_area.with_max_x(ink_area.max.x.min(bar.min.x)));
                                 let mut ink_ui = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(ink_area));
+                                crate::inkpad::set_ruler(ink_ui.ctx(), self.ruler);
+                                if crate::inkpad::take_replay_closed(ink_ui.ctx()) {
+                                    self.replaying = false;
+                                }
+                                crate::inkpad::set_replay(ink_ui.ctx(), self.replaying);
                                 ink_changed |= crate::inkpad::show(&mut ink_ui, ink_area, hit, top, pad, pen, pressure, &tokens, zoom_scale);
+                                if let Some(kind) = pad.take_recognised() {
+                                    recognised = Some(kind);
+                                }
                             }
                             // A press lets go of whatever was selected: the drag that may
                             // follow it builds a new one. Done here, once a frame, rather
@@ -8357,6 +8683,14 @@ impl NoteCraftApp {
             self.tell_kept_ink();
             self.sync_ink_reference();
         }
+        if let Some(kind) = recognised {
+            self.say(match kind {
+                "line" => crate::tl_id!("ui.recognised_line"),
+                "rectangle" => crate::tl_id!("ui.recognised_rectangle"),
+                "ellipse" => crate::tl_id!("ui.recognised_ellipse"),
+                _ => crate::tl_id!("ui.recognised_triangle"),
+            });
+        }
         if let Some(href) = follow {
             self.follow_link(ui.ctx(), &href);
         }
@@ -8457,6 +8791,12 @@ impl NoteCraftApp {
     // ---------- dialogs ----------
 
     fn dialogs(&mut self, ctx: &Context) {
+        // View > Immersive Reader (issue #299) covers the window until it is closed.
+        if let Some(reader) = self.reader.as_mut()
+            && crate::reader::show(ctx, reader, &self.tokens) == Some(crate::reader::Act::Close)
+        {
+            self.reader = None;
+        }
         if let Some(mut dialog) = self.custom_tags.take() {
             let out = dialog.show(ctx, &self.tokens);
             if let Some(list) = out.changed {
@@ -8497,6 +8837,7 @@ impl NoteCraftApp {
                 let mut clear = false;
                 let mut cancel = false;
                 egui::Window::new(crate::tl_id!("ui.clear_telemetry"))
+                    .title_bar(false)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
@@ -9183,6 +9524,52 @@ impl NoteCraftApp {
                     // Removing keeps the words and lets go of the address.
                     let replacement = if remove { text.trim().to_string() } else { pageedit::link_markup(text, address) };
                     self.replace_in_caret_line(block, cell, range, &replacement);
+                    keep = false;
+                }
+            }
+            Dialog::OnlineVideo { block, cell, range, address, first } => {
+                let mut go = false;
+                let video = crate::onlinevideo::read(address);
+                let backdrop = modal_backdrop(ctx, "online-video-backdrop");
+                egui::Window::new(crate::tl_id!("ui.online_video_title"))
+                    .title_bar(false)
+                    .collapsible(false)
+                    .resizable(false)
+                    .order(egui::Order::Foreground)
+                    .fixed_size(vec2(420.0, 0.0))
+                    .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                    .frame(modal_frame(&self.tokens))
+                    .show(ctx, |ui| {
+                        stay_above(ui, backdrop);
+                        modal_title(ui, &self.tokens, crate::tl_id!("ui.online_video_title"));
+                        ui.label(crate::tl_id!("ui.online_video_address"));
+                        let field = ui.add(egui::TextEdit::singleline(address).desired_width(400.0).hint_text("https://"));
+                        if *first {
+                            field.request_focus();
+                            *first = false;
+                        }
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && video.is_some() {
+                            go = true;
+                        }
+                        if !address.trim().is_empty() && video.is_none() {
+                            ui.colored_label(self.tokens.warn, crate::tl_id!("ui.online_video_bad_address"));
+                        }
+                        ui.label(egui::RichText::new(crate::tl_id!("ui.online_video_explain")).size(11.5).color(self.tokens.muted));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if modal_button(ui, &self.tokens, crate::tl_id!("ui.cancel"), false).clicked() || ui.input(|i| i.key_pressed(Key::Escape))
+                            {
+                                keep = false;
+                            }
+                            if modal_button_enabled(ui, &self.tokens, crate::tl_id!("ui.ok"), true, video.is_some()).clicked() {
+                                go = true;
+                            }
+                        });
+                    });
+                if go && let Some(video) = video {
+                    let (block, cell, range) = (*block, *cell, *range);
+                    self.replace_in_caret_line(block, cell, range, &crate::onlinevideo::line(&video));
+                    self.say(crate::tl_id!("ui.online_video_inserted"));
                     keep = false;
                 }
             }
@@ -9914,8 +10301,16 @@ impl NoteCraftApp {
             "engine.commands" => Ok(notecraft_engine::commands_json()),
             "engine.execute" => {
                 let id = text("command").ok_or("missing command")?;
-                let params = notecraft_engine::params_from_json(p.get("params"));
-                self.save_now();
+                let mut params = notecraft_engine::params_from_json(p.get("params"));
+                if id == "export.prepare" && !params.contains_key("body") && !params.contains_key("snapshot_path") {
+                    if let Some(path) = params.get("path")
+                        && let Ok(node) = self.session.resolve(path)
+                    {
+                        params.extend(self.export_snapshot_params(&node));
+                    }
+                } else if !id.starts_with("export.") {
+                    self.save_now();
+                }
                 let out = self.session.run(id, &params).map_err(|e| e.to_string())?;
                 if self.editor.as_ref().is_some_and(|ed| !ed.dir.exists()) {
                     self.editor = None;
@@ -9928,6 +10323,11 @@ impl NoteCraftApp {
                 if self.status_is_error { Err(self.status.clone()) } else { Ok(self.inspect(ctx)) }
             }
             // Put the caret in a block of the open page, the way a click does.
+            "ui.block" => {
+                let kind = p.get("kind").and_then(Value::as_str).ok_or("missing kind")?.to_string();
+                self.apply_block_kind(&kind);
+                Ok(json!({"kind": kind}))
+            }
             "ui.caret" => {
                 let Some(ed) = self.editor.as_mut() else { return Err("no page is open".into()) };
                 if !ed.writable {
@@ -10173,7 +10573,30 @@ impl NoteCraftApp {
                 "gain": self.gain(),
                 "strokes": self.pad.as_ref().map(crate::inkpad::Pad::strokes),
                 "inked": self.pad.as_ref().is_some_and(|p| !p.is_empty()),
+                // The readings of the newest stroke, in page points (issues #44, #293).
+                "lastStroke": self.pad.as_ref().map(crate::inkpad::Pad::last_stroke),
+                // Draw > Ink Replay (issue #295): how far it is, in strokes drawn whole.
+                "replay": crate::inkpad::replay(ctx).map(|r| json!({
+                    "shown": self.pad.as_ref().map_or(0, |p| crate::replay::shown(p.drawing(), r.at).0),
+                    "playing": r.playing,
+                    "speed": r.speed,
+                })),
+                "autoShapes": self.auto_shapes,
+                "tabsLayout": self.tabs_layout,
+                // Draw > Ruler (issue #293): where it lies once it is out, in page points.
+                "ruler": match crate::inkpad::ruler(ctx) {
+                    Some(crate::inkpad::RulerState::Placed(r)) => json!({"x": r.x, "y": r.y, "angle": r.angle, "degrees": r.shown_degrees()}),
+                    Some(crate::inkpad::RulerState::Unplaced) => json!({}),
+                    None => Value::Null,
+                },
             },
+            // View > Immersive Reader (issue #299), while it is open.
+            "reader": self.reader.as_ref().map(|r| json!({
+                "lines": r.lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>(),
+                "size": r.size,
+                "spacing": r.spacing,
+                "at": r.at,
+            })),
             // What a pen has told this window. `pen` is false until a device reports a
             // pressure at all, and `hardest` is the hardest press since the window opened.
             "pen": {"seen": self.stylus.sample().pen, "pressure": self.stylus.sample().pressure, "hardest": self.stylus.seen().0, "readings": self.stylus.seen().1},
@@ -10394,6 +10817,13 @@ impl NoteCraftApp {
         self.hierarchy_keys(ctx);
         self.restore_last_page();
         self.attach_dropped(ctx);
+        if matches!(self.backstage, Some("Export" | "Share"))
+            && self.dialog.is_none()
+            && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            let _ = self.session.run("export.cancel", &Params::new());
+            self.backstage = None;
+        }
         // The File screen takes the whole window while it is open, as it does in Office.
         if self.backstage.is_some() {
             self.title_band(ui, false);
@@ -10413,6 +10843,7 @@ impl NoteCraftApp {
         self.templates_panel(ui);
         // In a phone-width window a pane that fills it leaves no room for the page.
         if !self.compact_list_fills() && !(self.compact && (self.tags_pane.is_some() || self.templates_pane.is_some())) {
+            self.section_tabs(ui);
             self.central(ui);
         }
         self.paint_formatting(ctx);
@@ -10609,6 +11040,35 @@ fn theme_grid(ui: &mut Ui, current: Theme, pick: &mut Option<(Mode, Accent)>, fo
     ui.checkbox(follow, crate::tl_id!("ui.follow_the_system_light_or_dark_setting"));
 }
 
+/// The Welcome notebook's handwriting and drawing page among `notebooks` (issue #296): the
+/// one in the section for `language` (`10-en`, `20-ar`, ...), else the English one. The
+/// notebook is found by its contents, so a renamed or moved copy still works.
+fn drawing_help_page(notebooks: &[PathBuf], language: &str) -> Option<PathBuf> {
+    let base = language.split(['-', '_']).next().unwrap_or("en").to_ascii_lowercase();
+    let find = |code: &str| {
+        notebooks.iter().find_map(|notebook| {
+            let sections = std::fs::read_dir(notebook).ok()?;
+            sections.flatten().map(|e| e.path()).find_map(|section| {
+                let name = section.file_name()?.to_string_lossy().to_ascii_lowercase();
+                let page = section.join("how-to").join("handwriting-and-drawing");
+                (name.ends_with(&format!("-{code}")) && page.is_dir()).then_some(page)
+            })
+        })
+    };
+    find(&base).or_else(|| find("en"))
+}
+
+/// The notebooks folder chooser. The web build has no native folder dialog, so it chooses nothing.
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_notebooks_folder(start: &std::path::Path) -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title(crate::tl_id!("ui.choose_the_notebooks_folder")).set_directory(start).pick_folder()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_notebooks_folder(_start: &std::path::Path) -> Option<PathBuf> {
+    None
+}
+
 /// File > Save a Copy's folder chooser (issue #301). A browser has no folder dialog, so the web
 /// build chooses nothing and the folder is typed instead. Kept here, below the other choosers,
 /// and gated in its own right: the web build's rules rewrite the dialogs above by where they sit.
@@ -10625,6 +11085,53 @@ fn pick_copy_folder() -> Option<PathBuf> {
 #[cfg(test)]
 mod alert_tests {
     use super::*;
+
+    #[test]
+    fn ink_help_finds_the_drawing_page_in_the_welcome_notebook() {
+        // Issue #296, against the checked-in Welcome notebook in both formats.
+        let demo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/demo/DemoNotebook");
+        for format in ["html", "cmgfm"] {
+            let notebook = demo.join(format);
+            let english = drawing_help_page(std::slice::from_ref(&notebook), "en").expect("english page");
+            assert!(english.ends_with(Path::new("10-en/how-to/handwriting-and-drawing")), "{english:?}");
+            let arabic = drawing_help_page(std::slice::from_ref(&notebook), "ar-XB").expect("arabic page");
+            assert!(arabic.ends_with(Path::new("20-ar/how-to/handwriting-and-drawing")), "{arabic:?}");
+            let unknown = drawing_help_page(std::slice::from_ref(&notebook), "xx").expect("falls back");
+            assert_eq!(unknown, english, "a language with no section falls back to English");
+        }
+        assert_eq!(drawing_help_page(&[demo.join("no-such-notebook")], "en"), None);
+    }
+
+    #[test]
+    fn portable_control_snapshots_unsaved_text_without_saving_the_source() {
+        let t = notecraft_store::testing::TempDir::new("portable-control");
+        let settings = notecraft_store::Settings::at(t.path().join("settings.toml"));
+        settings.set("privacy_welcome_seen", "true").expect("settings");
+        let mut session = Session::new(&t.path().join("books"), settings).expect("session");
+        let sample = notecraft_engine::sample::create_sample(&mut session, Some(crate::LOGO_PNG)).expect("sample");
+        let mut app = NoteCraftApp::new(session);
+        app.open_path(&sample.html_page.to_string_lossy());
+        let before = std::fs::read(sample.html_page.join("index.html")).expect("source");
+        let editor = app.editor.as_mut().expect("editor");
+        editor.body = "<p>Unsaved review text</p>".into();
+        editor.arranged = false;
+        editor.dirty_since = Some(Instant::now());
+        let ctx = egui::Context::default();
+        app.control_method(&ctx, "engine.execute", &json!({"command":"export.prepare", "params":{"path":sample.html_page}})).expect("review");
+        assert_eq!(std::fs::read(sample.html_page.join("index.html")).expect("source unchanged"), before);
+        assert!(
+            app.session
+                .reviewed_export()
+                .expect("snapshot")
+                .entries()
+                .any(|(_, b)| std::str::from_utf8(b).is_ok_and(|s| s.contains("Unsaved review text")))
+        );
+        app.control_method(&ctx, "engine.execute", &json!({"command":"export.cancel"})).expect("cancel");
+        assert_eq!(std::fs::read(sample.html_page.join("index.html")).expect("source unchanged after cancel"), before);
+        assert!(app.session.reviewed_export().is_none());
+        // Prevent the app's normal exit autosave from becoming part of this read-only check.
+        app.editor.as_mut().expect("editor").dirty_since = None;
+    }
 
     #[test]
     fn opening_a_notebook_folder_displays_its_page_instead_of_the_previous_notebook() {
@@ -10766,6 +11273,39 @@ mod alert_tests {
 
         // Dialog should not be shown because privacy_welcome_seen is set
         assert!(app.dialog.is_none(), "PrivacyWelcome dialog should not show after being dismissed");
+    }
+
+    #[test]
+    fn choosing_a_notebooks_folder_moves_to_it_now() {
+        let t = notecraft_store::testing::TempDir::new("notebooks-folder-choice");
+        let settings = notecraft_store::Settings::at(t.path().join("settings.toml"));
+        settings.set("privacy_welcome_seen", "true").expect("settings");
+        let session = Session::new(&t.path().join("notebooks"), settings.clone()).expect("session");
+        let mut app = NoteCraftApp::new(session);
+        let chosen = t.path().join("chosen");
+
+        app.apply_notebooks_root_choice(Some(&chosen));
+
+        assert_eq!(app.session().root(), std::fs::canonicalize(&chosen).expect("canonical").as_path(), "the window moves to the chosen folder");
+        assert_eq!(settings.get("last_notebooks_root"), Some(chosen.to_string_lossy().into_owned()), "the choice is remembered");
+    }
+
+    #[test]
+    fn after_a_change_the_window_lists_the_notebooks_in_the_new_folder() {
+        let t = notecraft_store::testing::TempDir::new("notebooks-folder-list");
+        let settings = notecraft_store::Settings::at(t.path().join("settings.toml"));
+        settings.set("privacy_welcome_seen", "true").expect("settings");
+        let session = Session::new(&t.path().join("notebooks"), settings.clone()).expect("session");
+        let mut app = NoteCraftApp::new(session);
+        let chosen = t.path().join("chosen");
+        notecraft_store::ops::create_notebook(&chosen, "Research", None, &settings).expect("a notebook in the chosen folder");
+
+        app.apply_notebooks_root_choice(Some(&chosen));
+
+        assert!(
+            app.session().tree().iter().any(|n| n.path.ends_with("research")),
+            "the notebook in the chosen folder is listed at once, not after a restart"
+        );
     }
 
     #[test]

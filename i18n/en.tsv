@@ -1075,3 +1075,120 @@
 @id	ui.paragraph_spacing_set	Paragraph spacing set
 @id	ui.reading_the_onenote_files	Reading the OneNote files…
 @id	ui.the_import_stopped_unexpectedly	The import stopped unexpectedly
+@id	ui.portable_export_title	Portable export and sharing
+@id	ui.portable_export_explanation	Review a portable notebook folder with the selected content, its assets and linked local pages. Preparation never sends data or changes the source.
+@id	ui.portable_share_fallback	System sharing is not integrated yet. Save the export, then share the whole folder with your chosen app. A local path does not grant remote access. No account is required.
+@id	ui.portable_open_page	Open a page to choose its page, section or notebook.
+@id	ui.portable_original_formats	Format: original HTML / CMGFM files, with no conversion. This is an export snapshot, not Save a Copy or Print. OneNote and PDF export are not offered here.
+@id	ui.portable_download_destination	Destination: your browser download folder. The reviewed files will be packaged as ZIP. Unzip the whole folder before opening it in NoteCraft.
+@id	ui.portable_destination	Export destination folder
+@id	ui.portable_no_overwrite	A new export folder is created. Existing files are never overwritten. Saved versions, recycle bins and templates are excluded.
+@id	ui.portable_review	Review export
+@id	ui.portable_cancel	Cancel export
+@id	ui.portable_review_summary	{title} | Pages: {pages} | Files: {files} | Bytes: {bytes}
+@id	ui.portable_dependencies	Included linked content outside the selected scope. Review these additional files before exporting:
+@id	ui.portable_external_links	External links are preserved. Their content is not downloaded and may need a network connection or another app:
+@id	ui.portable_included_files	Included files
+@id	ui.portable_page_contents	Page text preview
+@id	ui.portable_review_snapshot	Writing uses this reviewed snapshot, including unsaved page text. Review again to include later edits. Share every exported file together.
+@id	ui.portable_write	Write reviewed export
+@id	ui.portable_download_ready	The reviewed archive was handed to your browser for download.
+@id	ui.portable_saved	Export saved in {path}
+@id	ui.portable_no_snapshot	Review the export before writing it.
+@id	ui.portable_send_hint	Review a portable copy of this page before sharing it
+@id	ui.ink_help_2	Ink\nHelp
+@id	ui.ink_help_tip	Open the Welcome notebook's page on handwriting and drawing
+@id	ui.ink_help_missing	The drawing help is in the Welcome notebook, which is not open. Add it again from the first-use prompt, or open its folder from File > Open.
+@id	ui.online_video_2	Online\nVideo
+@id	ui.online_video_tip	Put a link to a video on the web into the page
+@id	ui.online_video_title	Online Video
+@id	ui.online_video_address	Video address
+@id	ui.online_video_line	Video ({site}): {address}
+@id	ui.online_video_explain	The page keeps a link. Nothing is loaded until you click it, and then it opens in your browser.
+@id	ui.online_video_bad_address	Paste the address of a video on the web, starting with https://
+@id	ui.online_video_inserted	Added a link to the video.
+@id	ui.ruler_2	Ruler
+@id	ui.ruler_tip	Lay a ruler on the page: ink drawn along its edge comes out straight. Drag it to move it, drag its round handle to turn it, or press [ and ] (with Shift, 15 degrees). Press again to put it away.
+@id	ui.reader_focus_off	Off
+@id	ui.reader_focus_one	1 line
+@id	ui.reader_focus_three	3 lines
+@id	ui.reader_focus_five	5 lines
+@id	ui.reader_picture_without_description	Picture (no description)
+@id	ui.reader_picture_alt	Picture: {alt}
+@id	ui.reader_handwriting_not_shown	This page has handwriting, which the reader does not show. Close the reader to see it.
+@id	ui.reader_text_size	Text size
+@id	ui.reader_smaller	Smaller
+@id	ui.reader_larger	Larger
+@id	ui.reader_smaller_text	Make the text smaller
+@id	ui.reader_larger_text	Make the text larger
+@id	ui.reader_line_spacing	Line spacing
+@id	ui.reader_less	Less
+@id	ui.reader_more	More
+@id	ui.reader_less_space	Less room between lines
+@id	ui.reader_more_space	More room between lines
+@id	ui.reader_line_focus	Line focus
+@id	ui.reader_close	Close
+@id	ui.reader_close_tip	Back to the page (Escape)
+@id	ui.reader_read_aloud_not_available	Up and Down move the line focus. Read aloud is not built yet: NoteCraft has no speech service on any platform.
+@id	ui.immersive_reader_tip	Read the page in large, plain type with a line focus. The page is not changed.
+@id	ui.reader_open_a_page	Open a page to read it in the Immersive Reader.
+@id	ui.automatic_shapes_2	Automatic\nShapes
+@id	ui.automatic_shapes_tip	When on, a line, rectangle, ellipse or triangle drawn by hand is redrawn clean as the pen lifts. Undo brings back what you drew.
+@id	ui.automatic_shapes_on	Automatic Shapes is on: plain lines, rectangles, ellipses and triangles are redrawn clean.
+@id	ui.automatic_shapes_off	Automatic Shapes is off.
+@id	ui.recognised_line	Drawn as a straight line. Undo brings back what you drew.
+@id	ui.recognised_rectangle	Drawn as a rectangle. Undo brings back what you drew.
+@id	ui.recognised_ellipse	Drawn as an ellipse. Undo brings back what you drew.
+@id	ui.recognised_triangle	Drawn as a triangle. Undo brings back what you drew.
+@id	ui.ink_replay_2	Ink\nReplay
+@id	ui.ink_replay_tip	Draw the page's ink again, stroke by stroke, in the order it was drawn. The page is not changed.
+@id	ui.ink_replay_title	Ink Replay
+@id	ui.replay_restart	Restart
+@id	ui.replay_previous	Previous stroke
+@id	ui.replay_previous_tip	Back one stroke
+@id	ui.replay_pause	Pause
+@id	ui.replay_pause_tip	Pause (Space)
+@id	ui.replay_play	Play
+@id	ui.replay_play_tip	Play (Space)
+@id	ui.replay_next	Next stroke
+@id	ui.replay_next_tip	Forward one stroke
+@id	ui.replay_speed	Speed {speed}x
+@id	ui.replay_speed_tip	Change the speed: 0.5x, 1x, 2x, 4x
+@id	ui.replay_count	{shown} of {total} strokes
+@id	ui.replay_close_tip	Stop the replay and go back to the page (Escape)
+@id	ui.replay_order_note	Strokes come back in the order they were drawn, each at an even speed: NoteCraft keeps the order, not the times.
+@id	ui.replay_nothing_to_replay	This page has no ink to replay.
+@id	ui.tabs_layout_tip	Show this notebook's sections as coloured tabs across the top of the page. The tree stays in the side panel.
+@id	ui.tabs_layout_on	Sections are shown as tabs over the page.
+@id	ui.tabs_layout_off	Sections are shown in the tree only.
+@id	ui.section_group_tab	{name} (group)
+@id	ui.this_group_has_no_sections	This group has no sections.
+@id	ui.this_section_has_no_pages_yet	This section has no pages yet.
+@id	ui.colour_dark_red	Dark Red
+@id	ui.colour_red	Red
+@id	ui.colour_orange	Orange
+@id	ui.colour_yellow	Yellow
+@id	ui.colour_light_green	Light Green
+@id	ui.colour_green	Green
+@id	ui.colour_light_blue	Light Blue
+@id	ui.colour_blue	Blue
+@id	ui.colour_dark_blue	Dark Blue
+@id	ui.colour_purple	Purple
+@id	ui.colour_bright_green	Bright Green
+@id	ui.colour_turquoise	Turquoise
+@id	ui.colour_pink	Pink
+@id	ui.colour_gray	Gray
+@id	ui.font_colour	Font Colour
+@id	ui.font_colour_tip	Colour the selected words, or what you type next
+@id	ui.text_highlight_colour	Text Highlight Colour
+@id	ui.text_highlight_colour_tip	Mark the selected words with a highlight colour, or what you type next
+@id	ui.automatic_colour	Automatic
+@id	ui.notebooks_folder	Notebooks folder
+@id	ui.notebooks_folder_hint	Notebooks already in the folder you choose open now. New notebooks go there from the next start. Nothing is moved.
+@id	ui.change_notebooks_folder	Change notebooks folder...
+@id	ui.use_the_default_notebooks_folder	Use the default folder
+@id	ui.choose_the_notebooks_folder	Choose the notebooks folder
+@id	ui.could_not_save_the_notebooks_folder_error	Could not save the notebooks folder: {error}
+@id	ui.notebooks_folder_current	NoteCraft keeps new notebooks in {folder}.
+@id	ui.notebooks_folder_changed	The notebooks folder is now {folder}.
+@id	ui.could_not_open_the_notebooks_folder_error	Could not open the notebooks folder: {error}

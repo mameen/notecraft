@@ -39,6 +39,10 @@ pub enum Act {
     SetUiLanguage(String),
     /// Draw the whole window at this size, in percent of the system's own scale.
     SetUiScale(u16),
+    /// Pick the folder NoteCraft keeps new notebooks in, from the next start.
+    ChooseNotebooksFolder,
+    /// Go back to the default notebooks folder, from the next start.
+    UseDefaultNotebooksFolder,
     OpenTelemetryFolder(std::path::PathBuf),
     ClearTelemetry(std::path::PathBuf),
     ExportTelemetry(std::path::PathBuf),
@@ -102,8 +106,8 @@ pub const SIDE: [(&str, bool); 10] = [
     ("Open", true),
     ("Save a Copy", true),
     ("Print", false),
-    ("Share", false),
-    ("Export", false),
+    ("Share", true),
+    ("Export", true),
     ("Account", false),
     ("Options", true),
     ("About", true),
@@ -170,6 +174,9 @@ pub fn show(
     ui_scale: u16,
     update: &crate::update::Status,
     copy: &mut CopyChoice,
+    export: &mut crate::portable::Choice,
+    review: Option<&notecraft_store::export::Prepared>,
+    export_acts: &mut Vec<crate::portable::Act>,
     t: &Tokens,
 ) -> Vec<Act> {
     let mut acts = Vec::new();
@@ -183,10 +190,23 @@ pub fn show(
                     "New" => new_page(ui, notebooks_folder, t, &mut acts),
                     "Open" => open_page(ui, recent, notebooks_folder, show_path, t, &mut acts),
                     "Save a Copy" => save_copy_page(ui, copy, show_path, t, &mut acts),
-                    "About" => about_page(ui, telemetry_root, session_id, update, t, &mut acts),
-                    "Options" => {
-                        options_page(ui, telemetry_root, telemetry_level, session_id, ui_language, languages, ui_scale, update, t, &mut acts)
+                    "Share" | "Export" => {
+                        *export_acts = crate::portable::show(ui, export, review, t);
                     }
+                    "About" => about_page(ui, telemetry_root, session_id, update, t, &mut acts),
+                    "Options" => options_page(
+                        ui,
+                        telemetry_root,
+                        notebooks_folder,
+                        telemetry_level,
+                        session_id,
+                        ui_language,
+                        languages,
+                        ui_scale,
+                        update,
+                        t,
+                        &mut acts,
+                    ),
                     _ => info_page(ui, notebooks, notebooks_folder, show_path, t, &mut acts),
                 }
             });
@@ -578,6 +598,7 @@ fn scale_label(percent: u16) -> String {
 fn options_page(
     ui: &mut Ui,
     root: &std::path::Path,
+    notebooks_folder: &str,
     level: &str,
     session_id: Option<&str>,
     ui_language: &str,
@@ -588,6 +609,20 @@ fn options_page(
     acts: &mut Vec<Act>,
 ) {
     heading(ui, crate::tl_id!("ui.options"), t);
+    ui.label(egui::RichText::new(crate::tl_id!("ui.notebooks_folder")).strong().size(15.0).color(t.strong));
+    let current = crate::i18n::format_message_id("ui.notebooks_folder_current", &[("folder", notebooks_folder)]);
+    ui.label(egui::RichText::new(current).size(12.0).color(t.text));
+    ui.horizontal(|ui| {
+        // The web build has no folder dialog, so the change button is shown only where one exists.
+        if !cfg!(target_arch = "wasm32") && open_action(ui, crate::tl_id!("ui.change_notebooks_folder"), 230.0, 34.0, t, true).clicked() {
+            acts.push(Act::ChooseNotebooksFolder);
+        }
+        if open_action(ui, crate::tl_id!("ui.use_the_default_notebooks_folder"), 260.0, 34.0, t, false).clicked() {
+            acts.push(Act::UseDefaultNotebooksFolder);
+        }
+    });
+    ui.label(egui::RichText::new(crate::tl_id!("ui.notebooks_folder_hint")).size(11.5).color(t.muted));
+    ui.add_space(12.0);
     let automatic = crate::tl_id!("ui.automatic_system_language");
     let selected = if ui_language == crate::i18n::AUTO {
         automatic.to_string()
@@ -671,7 +706,6 @@ fn options_page(
     });
     ui.add_space(12.0);
     ui.label(egui::RichText::new(crate::tl_id!("ui.export_creates_a_user_selected_zip_then_removes_the_66f2bf3400")).size(11.5).color(t.muted));
-    ui.add_space(18.0);
     ui.separator();
     ui.label(egui::RichText::new(crate::tl_id!("ui.application_preferences")).strong().size(15.0).color(t.strong));
     ui.label(egui::RichText::new(crate::tl_id!("ui.reset_themes_layout_ribbon_choices_and_other_saved_n_61cc3d1cfb")).size(11.5).color(t.muted));
@@ -707,7 +741,7 @@ mod tests {
     #[test]
     fn the_side_entries_say_what_works() {
         let built: Vec<&str> = SIDE.iter().filter(|(_, b)| *b).map(|(n, _)| *n).collect();
-        assert_eq!(built, vec!["Info", "New", "Open", "Save a Copy", "Options", "About"]);
+        assert_eq!(built, vec!["Info", "New", "Open", "Save a Copy", "Share", "Export", "Options", "About"]);
         assert_eq!(SIDE.len(), 10, "the rest are listed and marked, not hidden");
         assert!(SIDE.iter().any(|(n, b)| *n == "Print" && !*b));
     }
@@ -733,6 +767,9 @@ mod tests {
                 100,
                 &crate::update::Status::Idle,
                 &mut CopyChoice::default(),
+                &mut crate::portable::Choice::default(),
+                None,
+                &mut Vec::new(),
                 &t,
             );
         });

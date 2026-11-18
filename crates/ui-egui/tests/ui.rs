@@ -41,6 +41,146 @@ fn press_copy(h: &mut Harness<'_, NoteCraftApp>, board: &MemoryBoard, key: &str)
 const LIGHT: Theme = Theme { mode: Mode::Light, accent: Accent::Default };
 const DARK: Theme = Theme { mode: Mode::Dark, accent: Accent::Default };
 
+/// The three entry points share a review surface and never export just by opening it.
+#[test]
+fn portable_export_share_and_send_page_require_review() {
+    let _pixels = support::gui::pixel_test();
+    for entry in ["Export", "Share", "Send Page"] {
+        let (t, mut app, sample) = sample_app("portable-entry");
+        app.open_path(&sample.html_page.to_string_lossy());
+        let before = std::fs::read(sample.html_page.join("index.html")).expect("source");
+        let mut h = sized_harness(app, LIGHT, egui::vec2(1800.0, 1000.0));
+        settle(&mut h);
+        if entry != "Send Page" {
+            h.get_by_label("File").click();
+            settle(&mut h);
+        }
+        h.get_by_label(entry).click();
+        settle(&mut h);
+        assert!(h.query_all_by_label("Review export").count() > 0, "{entry} must open export review");
+        h.get_by_label("Review export").click();
+        settle(&mut h);
+        assert!(h.query_all_by_label("Write reviewed export").count() > 0);
+        review(&mut h, &format!("portable-{}", entry.replace(' ', "-")));
+        assert_eq!(std::fs::read(sample.html_page.join("index.html")).expect("source"), before);
+        h.get_by_label("Cancel export").click();
+        settle(&mut h);
+        assert_eq!(h.query_all_by_label("Write reviewed export").count(), 0);
+        assert!(!t.path().join("export").exists());
+    }
+}
+
+#[test]
+fn portable_export_writes_the_reviewed_section_and_download_hosts_get_the_same_files() {
+    for download in [false, true] {
+        let (t, mut app, sample) = sample_app("portable-write");
+        app.open_path(&sample.md_page.to_string_lossy());
+        if download {
+            app.enable_file_downloads();
+        }
+        let out = t.path().join("exports");
+        std::fs::create_dir(&out).expect("destination");
+        let section = sample.md_page.parent().expect("section");
+        let section_title = notecraft_store::tree::read_node(section).expect("section").title;
+        let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1000.0));
+        settle(&mut h);
+        h.get_by_label("File").click();
+        settle(&mut h);
+        h.get_by_label("Export").click();
+        settle(&mut h);
+        h.get_by_label(&format!("This section: {section_title}")).click();
+        settle(&mut h);
+        if !download {
+            h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Export destination folder").click();
+            settle(&mut h);
+            h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Export destination folder").type_text(&out.to_string_lossy());
+            settle(&mut h);
+        }
+        h.get_by_label("Review export").click();
+        settle(&mut h);
+        assert!(h.state_mut().take_file_downloads().is_empty());
+        assert_eq!(std::fs::read_dir(&out).expect("not yet").count(), 0);
+        h.get_by_label("Write reviewed export").click();
+        settle(&mut h);
+        if download {
+            let downloads = h.state_mut().take_file_downloads();
+            assert_eq!(downloads.len(), 1);
+            assert_eq!(downloads[0].mime, "application/zip");
+            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&downloads[0].bytes)).expect("portable ZIP");
+            assert!(zip.len() > 2);
+            let md = zip.file_names().find(|n| n.ends_with("index.md")).expect("CMGFM page").to_string();
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut zip.by_name(&md).expect("page"), &mut text).expect("body");
+            assert!(text.contains("plain files"));
+            assert!(h.state_mut().take_file_downloads().is_empty(), "host output is delivered once");
+            assert_eq!(std::fs::read_dir(&out).expect("no disk writes").count(), 0);
+        } else {
+            let container = std::fs::read_dir(&out).expect("output").next().expect("export folder").expect("entry").path();
+            let notebook = std::fs::read_dir(&container).expect("container").next().expect("notebook").expect("entry").path();
+            assert_eq!(notecraft_store::tree::read_node(&notebook).expect("independent notebook").kind, notecraft_model::NodeKind::Notebook);
+            assert!(!notebook.join(".notecraft").exists());
+        }
+    }
+}
+
+#[test]
+fn portable_export_back_discards_the_reviewed_snapshot() {
+    let (_t, mut app, sample) = sample_app("portable-back");
+    app.open_path(&sample.html_page.to_string_lossy());
+    let mut h = harness(app, LIGHT);
+    settle(&mut h);
+    h.get_by_label("File").click();
+    settle(&mut h);
+    h.get_by_label("Export").click();
+    settle(&mut h);
+    h.get_by_label("Review export").click();
+    settle(&mut h);
+    assert!(h.state().session().reviewed_export().is_some());
+    h.state_mut().session_mut().run("export.cancel", &Params::new()).expect("drop snapshot while the Review button keeps focus");
+    h.get_by_label("Review export").focus();
+    settle(&mut h);
+    h.key_press(egui::Key::Space);
+    settle(&mut h);
+    assert!(h.state().session().reviewed_export().is_some(), "the focused Review button supports keyboard activation");
+    assert!(h.state_mut().system_back());
+    settle(&mut h);
+    assert!(h.state().session().reviewed_export().is_none(), "Back must discard retained outgoing content");
+    h.get_by_label("File").click();
+    settle(&mut h);
+    h.get_by_label("Export").click();
+    settle(&mut h);
+    h.get_by_label("Review export").click();
+    settle(&mut h);
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.state().session().reviewed_export().is_none(), "Escape must discard the review too");
+    assert_eq!(h.query_all_by_label("Write reviewed export").count(), 0, "Escape returns to the page");
+}
+
+#[test]
+fn portable_export_review_is_accessible_in_a_narrow_window_in_light_and_dark() {
+    let _pixels = support::gui::pixel_test();
+    for theme in [LIGHT, DARK] {
+        let (_t, mut app, sample) = sample_app("portable-accessibility");
+        app.open_path(&sample.md_page.to_string_lossy());
+        app.set_theme(theme);
+        app.open_backstage_page("Export");
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(820.0, 760.0))
+            .with_accessibility_check(true)
+            .renderer(support::gui::renderer())
+            .build_ui_state(|ui, app: &mut NoteCraftApp| app.show(ui), app);
+        settle(&mut h);
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Export destination folder");
+        h.get_by_label("Review export").click();
+        settle(&mut h);
+        assert!(h.query_all_by_label("Write reviewed export").count() > 0);
+        h.get_by_label("Page text preview").click();
+        settle(&mut h);
+        review(&mut h, &format!("portable-narrow-{}", theme.id()));
+    }
+}
+
 // The system clipboard is shared by parallel UI tests, even when each test has its own window.
 fn params(pairs: &[(&str, &str)]) -> Params {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -8598,7 +8738,7 @@ fn a_selected_box_takes_the_ribbon_as_a_whole() {
     click(&mut h, row.center().x, row.center().y);
     settle(&mut h);
     let body = h.state().body().unwrap_or_default().to_string();
-    assert!(body.contains("```\nFormat ideas\n```"), "the blocks of the box became code:\n{body}");
+    assert!(body.contains("```123|\nFormat ideas\n```"), "the blocks of the box became numbered code:\n{body}");
     assert_eq!(look(&mut h).pointer("/page/selectedContainer").and_then(Value::as_u64), Some(0), "still picked after the list");
 
     // Cut takes the whole box away with what is in it.
@@ -10417,16 +10557,304 @@ fn numbered_code_shows_its_numbers_in_view_and_hides_them_in_edit() {
     app.open_path(&s.md_page.to_string_lossy());
     let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
     settle(&mut h);
-    assert_eq!(h.query_all_by_label("1\n2\n3").count(), 1, "the numbers are drawn beside the code");
+    assert_eq!(h.query_all_by_label("1 |\n2 |\n3 |").count(), 1, "the numbers are drawn beside the code");
     assert!(h.query_all_by_label("123|rust").count() == 0 && h.query_all_by_label("rust").count() >= 1, "the label is the language alone");
     let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
     ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret");
     for _ in 0..4 {
         pump(&mut h);
     }
-    assert_eq!(h.query_all_by_label("1\n2\n3").count(), 0, "no numbers while it is written in");
+    assert_eq!(h.query_all_by_label("1 |\n2 |\n3 |").count(), 0, "no numbers while it is written in");
     let file = std::fs::read_to_string(s.md_page.join("index.md")).unwrap_or_default();
     assert!(file.contains("```123|rust"), "the page keeps saying so");
+}
+
+/// Down from the paragraph above a numbered code block puts the caret at the start of the block's
+/// first line (owner, 2026-11-11). Enter then adds a line before "line one".
+#[test]
+fn down_into_a_code_block_lands_at_its_first_line() {
+    let (_t, app, s) = sample_app("ui-code-down-start");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\nA paragraph above.\n\n```123|rust\nline one\nline two\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 2})).expect("caret into the paragraph");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "ArrowDown"})).expect("down");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "Enter"})).expect("enter");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("leave the code block so it saves");
+    settle(&mut h);
+    for _ in 0..60 {
+        pump(&mut h);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = std::fs::read_to_string(s.md_page.join("index.md")).unwrap_or_default();
+    assert!(file.contains("```123|rust\n\nline one\nline two\n```"), "Down did not land at the start of the first line:\n{file}");
+}
+
+/// Lines are inserted above a numbered code block. Up from its first line leaves it (the numbers
+/// come back) instead of getting stuck.
+#[test]
+fn up_from_the_first_line_leaves_a_code_block_with_lines_above_it() {
+    let (_t, app, s) = sample_app("ui-code-edge-up");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\nPara one.\n\nPara two.\n\n```123|rust\nline one\nline two\nline three\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret into the code block");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "Home"})).expect("start of last code line");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    for _ in 0..2 {
+        ask(&mut h, "ui.key", json!({"key": "ArrowUp"})).expect("first code line");
+        for _ in 0..4 {
+            pump(&mut h);
+        }
+    }
+    ask(&mut h, "ui.key", json!({"key": "ArrowUp"})).expect("up");
+    for _ in 0..6 {
+        pump(&mut h);
+    }
+    assert_eq!(h.query_all_by_label("1 |\n2 |\n3 |").count(), 1, "Up from the first line left the block: the numbers are back");
+}
+
+/// Down from the last line of a numbered code block leaves it with lines below it.
+#[test]
+fn down_from_the_last_line_leaves_a_code_block_with_lines_below_it() {
+    let (_t, app, s) = sample_app("ui-code-edge-down");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\n```123|rust\nline one\nline two\nline three\n```\n\nPara after.\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 2})).expect("caret into the code block");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    for key in ["ArrowDown", "ArrowDown", "ArrowDown", "ArrowDown"] {
+        ask(&mut h, "ui.key", json!({"key": key})).expect("key");
+        for _ in 0..6 {
+            pump(&mut h);
+        }
+    }
+    assert_eq!(h.query_all_by_label("1 |\n2 |\n3 |").count(), 1, "Down from the last line did not leave the block");
+}
+
+/// Up from the first line of a code block lands at the end of the paragraph above it.
+#[test]
+fn up_from_a_code_block_lands_at_the_end_of_the_paragraph_above() {
+    let (_t, app, s) = sample_app("ui-code-up-end");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\nPara two.\n\n```123|rust\nline one\nline two\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret into the code block");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "Home"})).expect("start of last code line");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "ArrowUp"})).expect("first code line");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "ArrowUp"})).expect("up");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.text", json!({"text": "X"})).expect("type");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("leave the paragraph so it saves");
+    settle(&mut h);
+    for _ in 0..60 {
+        pump(&mut h);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = std::fs::read_to_string(s.md_page.join("index.md")).unwrap_or_default();
+    assert!(file.contains("Para two.X"), "Up did not land at the end of the paragraph above:\n{file}");
+}
+
+/// Left at the start of a code block lands at the end of the text before it.
+#[test]
+fn left_from_a_code_block_lands_at_the_end_of_the_paragraph_above() {
+    let (_t, app, s) = sample_app("ui-code-left-end");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\nPara two.\n\n```123|rust\nline one\nline two\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret into the code block");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "Home"})).expect("start of last code line");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "ArrowUp"})).expect("first code line");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "ArrowLeft"})).expect("left");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.text", json!({"text": "Y"})).expect("type");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("leave the paragraph so it saves");
+    settle(&mut h);
+    for _ in 0..60 {
+        pump(&mut h);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = std::fs::read_to_string(s.md_page.join("index.md")).unwrap_or_default();
+    assert!(file.contains("Para two.Y"), "Left did not land at the end of the paragraph above:\n{file}");
+}
+
+/// Normal on the current (last) line of a numbered code block closes the block before it: the line
+/// becomes ordinary text (owner, 2026-11-12).
+#[test]
+fn normal_on_the_current_code_line_closes_the_block_before_it() {
+    let (_t, app, s) = sample_app("ui-code-split-normal");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\n```123|rust\nline one\nline two\nline three\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret into the code block");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.block", json!({"kind": "p"})).expect("normal");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("leave the block so it saves");
+    settle(&mut h);
+    for _ in 0..60 {
+        pump(&mut h);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = std::fs::read_to_string(s.md_page.join("index.md")).unwrap_or_default();
+    assert!(
+        file.contains("```123|rust\nline one\nline two\n```\n\nline three"),
+        "Normal did not turn the current line into text and close the block before it:\n{file}"
+    );
+}
+
+/// Applying Normal to the selected middle code line keeps the lines around it in the code block.
+#[test]
+fn normal_on_a_selected_code_line_splits_only_that_line() {
+    let (_t, app, s) = sample_app("ui-code-split-selected-normal");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\n```123|rust\nline one\nline two\nline three\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret into code");
+    settle(&mut h);
+    for _ in 0..1 {
+        ask(&mut h, "ui.key", json!({"key": "ArrowUp"})).expect("first code line");
+        settle(&mut h);
+    }
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Home"})).expect("start of code line");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "End", "shift": true})).expect("select code line");
+    settle(&mut h);
+    let selection = ask(&mut h, "ui.inspect", json!({})).expect("inspect selected line");
+    let caret = selection.pointer("/page/caret").expect("caret remains in code");
+    assert_eq!(caret["text"], "line one\nline two\nline three", "selection belongs to the code block");
+    assert_eq!(caret["anchor"], 9, "selection starts at line two");
+    assert_eq!(caret["at"], 17, "selection ends at line two");
+    let more = h.get_by_label("More styles").rect();
+    ask(&mut h, "ui.click", json!({"x": more.center().x, "y": more.center().y})).expect("open Styles gallery");
+    settle(&mut h);
+    let normal = h.query_all_by_label("Normal").last().expect("Normal style").rect();
+    ask(&mut h, "ui.click", json!({"x": normal.center().x, "y": normal.center().y})).expect("apply Normal");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("leave the code block so it saves");
+    settle(&mut h);
+    for _ in 0..60 {
+        pump(&mut h);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = std::fs::read_to_string(s.md_page.join("index.md")).unwrap_or_default();
+    assert!(
+        file.contains("```123|rust\nline one\n```\n\nline two\n\n```123|rust\nline three\n```"),
+        "Normal should split only the selected code line:\n{file}"
+    );
+}
+
+/// Up inside a numbered code block moves the caret one line up and keeps the block in edit mode.
+/// It leaves the block only from its first line (owner, 2026-11-11).
+#[test]
+fn up_in_a_code_block_moves_a_line_and_stays_in_edit_mode() {
+    let (_t, app, s) = sample_app("ui-code-up-lines");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\n```123|rust\nline one\nline two\nline three\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret into the code block");
+    for _ in 0..4 {
+        pump(&mut h);
+    }
+    // First line to third line, then Up: the caret must move to the second line, not leave the block.
+    for key in ["ArrowDown", "ArrowDown", "ArrowUp", "ArrowUp"] {
+        ask(&mut h, "ui.key", json!({"key": key})).expect("key");
+        for _ in 0..4 {
+            pump(&mut h);
+        }
+    }
+    assert_eq!(h.query_all_by_label("1 |\n2 |\n3 |").count(), 0, "Up left the block: the view with numbers came back");
+    let file = std::fs::read_to_string(s.md_page.join("index.md")).unwrap_or_default();
+    assert!(file.contains("```123|rust\nline one\nline two\nline three\n```"), "the words are unchanged");
 }
 
 /// Direction, tags and the lists reach every line of a selected box, not only the line the caret was in.
@@ -10712,13 +11140,13 @@ fn not_built_placeholders_are_disabled_for_accessibility() {
     settle(&mut h);
     h.get_by_label("View").click();
     settle(&mut h);
-    for name in ["Tabs layout", "Dock to desktop", "New window", "New quick note", "Immersive reader", "Live captions"] {
+    for name in ["Dock to desktop", "New window", "New quick note", "Live captions"] {
         let label = format!("{name} (not built)");
         let nodes: Vec<_> = h.query_all_by_label(&label).collect();
         assert!(!nodes.is_empty(), "{label} is listed");
         assert!(nodes.iter().all(|n| n.accesskit_node().is_disabled()), "{label} is reported as unavailable");
     }
-    for working in ["Zoom In", "Zoom Out", "Always on top", "Paper size"] {
+    for working in ["Zoom In", "Zoom Out", "Always on top", "Paper size", "Immersive reader", "Tabs layout"] {
         assert!(!h.get_by_label(working).accesskit_node().is_disabled(), "{working} still works");
     }
     // Insert's placeholders were already right and stay so.
@@ -11720,4 +12148,459 @@ fn the_soft_keyboard_is_wanted_only_while_a_block_has_the_caret() {
     ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
     settle(&mut h);
     assert!(h.state().keyboard_caret_rect().is_some(), "the caret asks for the keyboard");
+}
+
+/// Issue #293: Draw > Ruler was "not built". It lies on the page while it is out; a stroke
+/// begun just outside one of its long edges is laid along that edge however the hand shakes,
+/// a press on the ruler moves it and draws nothing, [ and ] turn it, and pressing the button
+/// again puts it away. The ruler itself is never written into the page.
+#[test]
+fn the_ruler_lays_a_shaky_stroke_straight_and_moves_without_drawing() {
+    let (_t, app, s) = sample_app("ui-ruler");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(2000.0, 900.0));
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    let state = |h: &mut Harness<'_, NoteCraftApp>| ask(h, "ui.inspect", json!({})).expect("inspect");
+    let body = h.state().body().unwrap_or_default().to_string();
+    h.get_by_label("Draw").click();
+    pump(&mut h);
+    h.get_by_label("Ruler").click();
+    settle(&mut h);
+    let v = state(&mut h);
+    assert_eq!(v["ink"]["pointer"], json!("draw"), "the ruler comes out with a pen in hand: {}", v["ink"]);
+    let (rx, ry) = (v["ink"]["ruler"]["x"].as_f64().expect("placed x") as f32, v["ink"]["ruler"]["y"].as_f64().expect("placed y") as f32);
+    assert_eq!(v["ink"]["ruler"]["degrees"], json!(0));
+    review(&mut h, "ruler");
+    let strokes = v["ink"]["strokes"].as_u64().unwrap_or(0);
+
+    // A wobbly line drawn just above the upper edge.
+    let origin = page_origin(&mut h);
+    let edge = ry - notecraft_ink::ruler::WIDTH / 2.0;
+    let at = |x: f32, y: f32| origin + egui::vec2(x, y);
+    let from = at(rx - 120.0, edge - 5.0);
+    ask(&mut h, "ui.press", json!({"x": from.x, "y": from.y})).expect("press");
+    pump(&mut h);
+    for k in 1..=8 {
+        let wobble = if k % 2 == 0 { -4.0 } else { 3.0 };
+        let p = at(rx - 120.0 + 30.0 * k as f32, edge - 6.0 + wobble);
+        ask(&mut h, "ui.move", json!({"x": p.x, "y": p.y})).expect("move");
+        pump(&mut h);
+    }
+    let end = at(rx + 120.0, edge - 6.0);
+    ask(&mut h, "ui.release", json!({"x": end.x, "y": end.y})).expect("release");
+    settle(&mut h);
+    let v = state(&mut h);
+    assert_eq!(v["ink"]["strokes"].as_u64(), Some(strokes + 1), "one stroke was drawn");
+    let points: Vec<(f32, f32)> = v["ink"]["lastStroke"]
+        .as_array()
+        .expect("readings")
+        .iter()
+        .map(|p| (p[0].as_f64().unwrap_or(0.0) as f32, p[1].as_f64().unwrap_or(0.0) as f32))
+        .collect();
+    assert!(points.len() >= 3, "{points:?}");
+    let ys: Vec<f32> = points.iter().map(|p| p.1).collect();
+    let spread = ys.iter().cloned().fold(f32::MIN, f32::max) - ys.iter().cloned().fold(f32::MAX, f32::min);
+    assert!(spread < 0.01, "the stroke lies along the edge: {ys:?}");
+    assert!(ys[0] < edge, "beside the ruler, not under it");
+    let reach = points.last().map_or(0.0, |p| p.0) - points[0].0;
+    assert!(reach > 200.0, "and follows the pen along it ({reach})");
+
+    // A drag on the ruler moves it and draws nothing.
+    let grab = at(rx, ry);
+    ask(&mut h, "ui.press", json!({"x": grab.x, "y": grab.y})).expect("press ruler");
+    pump(&mut h);
+    let to = at(rx + 40.0, ry + 60.0);
+    ask(&mut h, "ui.move", json!({"x": to.x, "y": to.y})).expect("move ruler");
+    pump(&mut h);
+    ask(&mut h, "ui.release", json!({"x": to.x, "y": to.y})).expect("release ruler");
+    settle(&mut h);
+    let v = state(&mut h);
+    assert_eq!(v["ink"]["strokes"].as_u64(), Some(strokes + 1), "moving the ruler drew nothing");
+    let moved = (v["ink"]["ruler"]["x"].as_f64().unwrap_or(0.0) as f32, v["ink"]["ruler"]["y"].as_f64().unwrap_or(0.0) as f32);
+    assert!((moved.0 - rx - 40.0).abs() < 1.0 && (moved.1 - ry - 60.0).abs() < 1.0, "the ruler moved with the pointer: {moved:?}");
+
+    // [ turns it anticlockwise a degree at a time, with Shift fifteen.
+    for _ in 0..3 {
+        h.key_press(egui::Key::OpenBracket);
+        pump(&mut h);
+    }
+    assert_eq!(state(&mut h)["ink"]["ruler"]["degrees"], json!(3));
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::CloseBracket);
+    pump(&mut h);
+    assert_eq!(state(&mut h)["ink"]["ruler"]["degrees"], json!(168), "Shift+] turns it fifteen degrees back past flat");
+
+    // Pressed again, it is put away; the page holds the ink and nothing of the ruler.
+    h.get_by_label("Ruler").click();
+    settle(&mut h);
+    assert_eq!(state(&mut h)["ink"]["ruler"], Value::Null);
+    h.state_mut().save();
+    let saved = notecraft_store::page::load_page(&s.html_page).expect("load").body;
+    assert!(!saved.to_ascii_lowercase().contains("ruler"), "the ruler is not page content:\n{saved}");
+    assert!(h.state().body().unwrap_or_default().len() >= body.len());
+}
+
+/// Issue #284: Insert > Online Video was "not built". It asks for the address of a video on
+/// the web, refuses what is not one, and puts a link to it at the caret: nothing is loaded
+/// until the link is clicked. The link is ordinary page text, so both formats keep it.
+#[test]
+fn online_video_puts_a_link_to_the_video_at_the_caret() {
+    for html in [false, true] {
+        let (_t, app, s) = sample_app("ui-online-video");
+        let mut h = sized_harness(app, LIGHT, egui::vec2(1800.0, 900.0));
+        h.run();
+        let page = if html { &s.html_page } else { &s.md_page };
+        notecraft_store::page::save_body(page, if html { "<p>Watch this: </p>" } else { "Watch this: " }).expect("fixture");
+        ask(&mut h, "ui.open", json!({"path": page.to_string_lossy()})).expect("open");
+        settle(&mut h);
+        ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+        settle(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "End"})).expect("end");
+        settle(&mut h);
+        h.get_by_label("Insert").click();
+        settle(&mut h);
+        h.get_by_label("Online Video").click();
+        settle(&mut h);
+        assert!(h.query_all_by_label("Video address").next().is_some(), "html={html}: the dialog asks for the address");
+        ask(&mut h, "ui.text", json!({"text": "javascript:alert(1)"})).expect("type");
+        settle(&mut h);
+        assert!(
+            h.query_all_by_label("Paste the address of a video on the web, starting with https://").next().is_some(),
+            "html={html}: what is not a web address is refused"
+        );
+        for _ in 0.."javascript:alert(1)".len() {
+            ask(&mut h, "ui.key", json!({"key": "Backspace"})).expect("erase");
+            pump(&mut h);
+        }
+        ask(&mut h, "ui.text", json!({"text": "https://youtu.be/dQw4w9WgXcQ"})).expect("type");
+        settle(&mut h);
+        review(&mut h, "online_video");
+        h.get_by_label("OK").click();
+        settle(&mut h);
+        h.state_mut().save();
+        let body = notecraft_store::page::load_page(page).expect("load").body;
+        let address = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+        let made = if html { format!("href=\"{address}\"") } else { format!("]({address})") };
+        assert!(body.contains(&made), "html={html}: a link to the video is in the page:\n{body}");
+        assert!(body.contains("Video (YouTube)"), "html={html}: it says what it is:\n{body}");
+        assert!(body.contains("Watch this:"), "html={html}: the words before it are kept:\n{body}");
+        // One Undo takes it out again.
+        ask(&mut h, "ui.key", json!({"key": "Z", "ctrl": true})).expect("undo");
+        settle(&mut h);
+        assert!(!h.state().body().unwrap_or_default().contains("youtube.com"), "html={html}: undo takes the video out");
+    }
+}
+
+/// Issue #299: View > Immersive Reader was "not built". It shows the open page as plain
+/// reading over the window, with text size, line spacing and a line focus, and leaves the
+/// page as it was when it is closed.
+#[test]
+fn the_immersive_reader_shows_the_page_as_reading_and_changes_nothing() {
+    let (_t, app, s) = sample_app("ui-immersive-reader");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1800.0, 900.0));
+    h.run();
+    notecraft_store::page::save_body(&s.md_page, "# Plan\n\nFirst **thing** to read.\n\n- an item\n").expect("fixture");
+    ask(&mut h, "ui.open", json!({"path": s.md_page.to_string_lossy()})).expect("open");
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    h.get_by_label("View").click();
+    settle(&mut h);
+    h.get_by_label("Immersive reader").click();
+    settle(&mut h);
+    let v = ask(&mut h, "ui.inspect", json!({})).expect("inspect");
+    let lines: Vec<String> = v["reader"]["lines"].as_array().expect("open").iter().map(|l| l.as_str().unwrap_or("").to_string()).collect();
+    assert!(lines.iter().any(|l| l == "Plan"), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "First thing to read."), "plain words, no markup: {lines:?}");
+    assert!(lines.iter().any(|l| l == "- an item"), "{lines:?}");
+    assert!(h.query_all_by_label_contains("Read aloud is not built yet").next().is_some(), "the missing speech is said");
+    h.get_by_label("Larger").click();
+    settle(&mut h);
+    h.get_by_label("More").click();
+    settle(&mut h);
+    h.get_by_label("3 lines").click();
+    settle(&mut h);
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    let v = ask(&mut h, "ui.inspect", json!({})).expect("inspect");
+    assert_eq!(v["reader"]["size"], json!(24.0));
+    assert!((v["reader"]["spacing"].as_f64().unwrap_or(0.0) - 1.8).abs() < 1e-4, "{}", v["reader"]);
+    assert_eq!(v["reader"]["at"], json!(1), "Down moves the line focus");
+    review(&mut h, "immersive_reader");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    let v = ask(&mut h, "ui.inspect", json!({})).expect("inspect");
+    assert_eq!(v["reader"], Value::Null, "Escape closes it");
+    assert_eq!(h.state().body().unwrap_or_default(), body, "the page is unchanged");
+    assert_eq!(v["page"]["dirty"], json!(false));
+}
+
+/// Issue #296: Draw > Ink Help was "not built". It opens the Welcome notebook's handwriting and
+/// drawing page, and with no Welcome notebook open it says where the help is instead.
+#[test]
+fn ink_help_opens_the_drawing_page_of_the_welcome_notebook() {
+    let (t, app, _s) = sample_app("ui-ink-help");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(2200.0, 900.0));
+    h.run();
+    h.get_by_label("Draw").click();
+    settle(&mut h);
+    h.get_by_label("Ink Help").click();
+    settle(&mut h);
+    assert!(h.state().status().contains("Welcome notebook, which is not open"), "{}", h.state().status());
+
+    let demo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/demo/DemoNotebook/html");
+    copy_tree(&demo, &t.path().join("notebooks").join("welcome-to-notecraft"));
+    h.get_by_label("Ink Help").click();
+    settle(&mut h);
+    let v = ask(&mut h, "ui.inspect", json!({})).expect("inspect");
+    let path = v["page"]["path"].as_str().unwrap_or_default().to_string();
+    assert!(path.ends_with("10-en/how-to/handwriting-and-drawing"), "the English drawing page opened: {path}");
+    assert_eq!(v["page"]["dirty"], json!(false), "and nothing was changed");
+}
+
+/// Picks up the first pen on the rack, as Alt+1 does.
+fn pick_up_first_pen(h: &mut Harness<'_, NoteCraftApp>) {
+    let alt = egui::Modifiers { alt: true, ..Default::default() };
+    h.input_mut().events.push(egui::Event::Key { key: egui::Key::Num1, physical_key: None, pressed: true, repeat: false, modifiers: alt });
+    h.step();
+    settle(h);
+}
+
+/// Draws one stroke through `points`, in page points from the page's origin.
+fn draw_through(h: &mut Harness<'_, NoteCraftApp>, points: &[(f32, f32)]) {
+    let origin = page_origin(h);
+    let at = |p: &(f32, f32)| origin + egui::vec2(p.0, p.1);
+    let Some(first) = points.first() else { return };
+    let start = at(first);
+    ask(h, "ui.press", json!({"x": start.x, "y": start.y})).expect("press");
+    pump(h);
+    for p in &points[1..] {
+        let q = at(p);
+        ask(h, "ui.move", json!({"x": q.x, "y": q.y})).expect("move");
+        pump(h);
+    }
+    let end = at(points.last().unwrap_or(first));
+    ask(h, "ui.release", json!({"x": end.x, "y": end.y})).expect("release");
+    settle(h);
+}
+
+/// The readings of the newest stroke, as `ui.inspect` reports them.
+fn last_stroke(h: &mut Harness<'_, NoteCraftApp>) -> Vec<(f32, f32)> {
+    let v = ask(h, "ui.inspect", json!({})).expect("inspect");
+    v["ink"]["lastStroke"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| (p[0].as_f64().unwrap_or(0.0) as f32, p[1].as_f64().unwrap_or(0.0) as f32))
+        .collect()
+}
+
+/// Issue #294: Draw > Automatic Shapes was "not built". With it on, a box drawn by hand is
+/// redrawn as a clean rectangle in the same place, the status says so, Undo brings back the
+/// hand-drawn stroke and Redo the rectangle. Handwriting-like strokes are left alone, and the
+/// setting is remembered.
+#[test]
+fn automatic_shapes_redraws_a_hand_drawn_box_and_undo_brings_it_back() {
+    let (_t, app, s) = sample_app("ui-auto-shapes");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(2000.0, 900.0));
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("Draw").click();
+    pump(&mut h);
+    h.get_by_label("Automatic Shapes").click();
+    settle(&mut h);
+    assert_eq!(ask(&mut h, "ui.inspect", json!({})).expect("inspect")["ink"]["autoShapes"], json!(true));
+    assert_eq!(h.state().session().settings.get("auto_shapes").as_deref(), Some("true"), "the choice is kept");
+    pick_up_first_pen(&mut h);
+    let strokes = |h: &mut Harness<'_, NoteCraftApp>| ask(h, "ui.inspect", json!({})).expect("inspect")["ink"]["strokes"].as_u64().unwrap_or(0);
+    let before = strokes(&mut h);
+
+    // A wobbly box, corner to corner.
+    let mut boxed = Vec::new();
+    for (k, (a, b)) in
+        [((200.0, 300.0), (420.0, 300.0)), ((420.0, 300.0), (420.0, 420.0)), ((420.0, 420.0), (200.0, 420.0)), ((200.0, 420.0), (202.0, 303.0))]
+            .into_iter()
+            .enumerate()
+    {
+        for i in 0..8 {
+            let t = i as f32 / 8.0;
+            let wobble = if (i + k) % 2 == 0 { 1.5 } else { -1.5 };
+            let (x, y): (f32, f32) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            boxed.push(if a.1 == b.1 { (x, y + wobble) } else { (x + wobble, y) });
+        }
+    }
+    boxed.push((202.0, 303.0));
+    draw_through(&mut h, &boxed);
+    assert_eq!(strokes(&mut h), before + 1, "one stroke");
+    assert!(h.state().status().contains("rectangle"), "{}", h.state().status());
+    let clean = last_stroke(&mut h);
+    let xs: std::collections::BTreeSet<i32> = clean.iter().map(|p| p.0.round() as i32).collect();
+    let left = xs.iter().next().copied().unwrap_or(0);
+    let right = xs.iter().last().copied().unwrap_or(0);
+    let on_sides = clean.iter().filter(|p| (p.0.round() as i32 == left) || (p.0.round() as i32 == right)).count();
+    assert!(on_sides >= clean.len() / 3, "the sides are straight up and down: {clean:?}");
+    assert!((left - 200).abs() <= 4 && (right - 420).abs() <= 4, "and where the hand drew them: {left}..{right}");
+    review(&mut h, "automatic_shapes");
+
+    h.get_by_label("Undo stroke").click();
+    settle(&mut h);
+    assert_eq!(strokes(&mut h), before + 1, "undo puts back what the hand drew, not nothing");
+    assert_ne!(last_stroke(&mut h), clean, "the hand-drawn stroke");
+    h.get_by_label("Redo stroke").click();
+    settle(&mut h);
+    assert_eq!(last_stroke(&mut h), clean, "redo gives the rectangle again");
+
+    // A squiggle like writing is left as it was drawn.
+    let squiggle: Vec<(f32, f32)> = (0..30).map(|i| (500.0 + i as f32 * 4.0, 300.0 + 12.0 * (i as f32 * 0.8).sin())).collect();
+    draw_through(&mut h, &squiggle);
+    assert_eq!(strokes(&mut h), before + 2);
+    assert!(!h.state().status().contains("Drawn as"), "{}", h.state().status());
+}
+
+/// Issue #295: Draw > Ink Replay was "not built". It draws the page's strokes again in the
+/// order they were drawn, can be paused and stepped, and closing it leaves the ink and the
+/// page as they were.
+#[test]
+fn ink_replay_plays_the_strokes_in_order_and_changes_nothing() {
+    let (_t, app, s) = sample_app("ui-ink-replay");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(2000.0, 900.0));
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("Draw").click();
+    pump(&mut h);
+    // Nothing to replay on a page with no ink.
+    h.get_by_label("Ink Replay").click();
+    settle(&mut h);
+    assert!(h.state().status().contains("no ink to replay"), "{}", h.state().status());
+
+    pick_up_first_pen(&mut h);
+    draw_through(&mut h, &[(200.0, 300.0), (260.0, 310.0), (320.0, 300.0)]);
+    draw_through(&mut h, &[(200.0, 360.0), (260.0, 370.0), (320.0, 360.0)]);
+    draw_through(&mut h, &[(200.0, 420.0), (260.0, 430.0), (320.0, 420.0)]);
+    let ink_file = s.html_page.join("ink.svg");
+    let saved = std::fs::read_to_string(&ink_file).expect("ink saved");
+    let replay = |h: &mut Harness<'_, NoteCraftApp>| ask(h, "ui.inspect", json!({})).expect("inspect")["ink"]["replay"].clone();
+
+    h.get_by_label("Ink Replay").click();
+    settle(&mut h);
+    let r = replay(&mut h);
+    assert!(r.is_object(), "the replay is open: {r}");
+    review(&mut h, "ink_replay");
+    h.get_by_label("Restart").click();
+    pump(&mut h);
+    h.get_by_label("Pause").click();
+    pump(&mut h);
+    assert_eq!(replay(&mut h)["shown"], json!(0), "back at the start");
+    h.get_by_label("Next stroke").click();
+    pump(&mut h);
+    assert_eq!(replay(&mut h)["shown"], json!(1), "one stroke at a time");
+    h.get_by_label("Next stroke").click();
+    pump(&mut h);
+    assert_eq!(replay(&mut h)["shown"], json!(2));
+    h.get_by_label("Previous stroke").click();
+    pump(&mut h);
+    assert_eq!(replay(&mut h)["shown"], json!(1));
+    h.get_by_label("Speed 1x").click();
+    pump(&mut h);
+    assert_eq!(replay(&mut h)["speed"], json!(2.0));
+    h.get_by_label("Play").click();
+    for _ in 0..240 {
+        pump(&mut h);
+    }
+    let r = replay(&mut h);
+    assert_eq!((r["shown"].clone(), r["playing"].clone()), (json!(3), json!(false)), "it plays to the end and stops: {r}");
+
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(replay(&mut h), Value::Null, "Escape closes it");
+    let v = ask(&mut h, "ui.inspect", json!({})).expect("inspect");
+    assert_eq!(v["ink"]["strokes"], json!(3), "the ink is all there");
+    assert_eq!(std::fs::read_to_string(&ink_file).expect("ink"), saved, "and its file is unchanged");
+}
+
+/// Issues #268 and #33: View > Tabs layout was "not built". It shows the notebook's sections
+/// as tabs over the page; a section group is a tab with a list; choosing opens the section's
+/// first page; the choice is remembered.
+#[test]
+fn tabs_layout_shows_sections_as_tabs_and_opens_them() {
+    let (_t, app, s) = sample_app("ui-tabs-layout");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1800.0, 900.0));
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("View").click();
+    settle(&mut h);
+    h.get_by_label("Tabs layout").click();
+    settle(&mut h);
+    assert_eq!(h.state().session().settings.get("tabs_layout").as_deref(), Some("true"));
+    review(&mut h, "tabs_layout");
+    let page =
+        |h: &mut Harness<'_, NoteCraftApp>| ask(h, "ui.inspect", json!({})).expect("inspect")["page"]["path"].as_str().unwrap_or("").to_string();
+    assert!(page(&mut h).ends_with("projects/project-x") || page(&mut h).contains("project"), "{}", page(&mut h));
+    h.query_all_by_role_and_label(egui::accesskit::Role::Button, "Ideas").last().expect("an Ideas tab").click();
+    settle(&mut h);
+    assert!(page(&mut h).contains("ideas"), "the Ideas tab opened its page: {}", page(&mut h));
+    h.get_by_label("Work (group)").click();
+    h.run_steps(2);
+    h.query_all_by_label("Projects").last().expect("the group's list").click();
+    settle(&mut h);
+    assert!(page(&mut h).contains("projects"), "the group's section opened: {}", page(&mut h));
+}
+
+/// Issue #260: Home had no Font Colour or Text Highlight Colour. Both palettes colour the
+/// selected words with exact colours that save the same in HTML and CMGFM, Automatic and No
+/// Colour take them off, and Undo puts things back.
+#[test]
+fn font_colour_and_highlight_colour_the_selected_words_in_both_formats() {
+    for html in [false, true] {
+        let (_t, app, s) = sample_app("ui-text-colour");
+        let mut h = sized_harness(app, LIGHT, egui::vec2(1800.0, 900.0));
+        h.run();
+        let page = if html { &s.html_page } else { &s.md_page };
+        notecraft_store::page::save_body(page, if html { "<p>colour these words</p>" } else { "colour these words" }).expect("fixture");
+        ask(&mut h, "ui.open", json!({"path": page.to_string_lossy()})).expect("open");
+        settle(&mut h);
+        ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+        settle(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "Home"})).expect("home");
+        pump(&mut h);
+        for _ in 0..7 {
+            ask(&mut h, "ui.key", json!({"key": "ArrowRight"})).expect("right");
+            pump(&mut h);
+        }
+        for _ in 0..5 {
+            ask(&mut h, "ui.key", json!({"key": "ArrowRight", "shift": true})).expect("pick");
+            pump(&mut h);
+        }
+        settle(&mut h);
+        h.get_by_label("Home").click();
+        settle(&mut h);
+        h.get_by_label("Font Colour").click();
+        h.run_steps(2);
+        review(&mut h, &format!("font_colour_{html}"));
+        h.get_by_label("Dark Red").click();
+        settle(&mut h);
+        h.get_by_label("Text Highlight Colour").click();
+        h.run_steps(2);
+        h.get_by_label("Yellow").click();
+        settle(&mut h);
+        h.state_mut().save();
+        let body = notecraft_store::page::load_page(page).expect("load").body;
+        assert!(body.contains("color: #c00000") && body.contains("background-color: #ffff00"), "html={html}: both colours saved:\n{body}");
+        assert!(body.contains("these"), "html={html}:\n{body}");
+        let blocks = notecraft_formats::markdown::parse(&if html { notecraft_formats::html::to_markdown(&body) } else { body.clone() });
+        let notecraft_formats::Block::Paragraph(spans) = &blocks[0] else { panic!("html={html}: a paragraph") };
+        let coloured: String = spans.iter().filter(|s| s.colour.as_deref() == Some("#c00000")).map(|s| s.text.as_str()).collect();
+        assert_eq!(coloured, "these", "html={html}: only the picked word");
+        assert!(spans.iter().filter(|s| s.colour.is_some()).all(|s| s.highlight.as_deref() == Some("#ffff00")));
+
+        // Automatic takes the colour off and leaves the highlight; Undo brings it back.
+        h.get_by_label("Font Colour").click();
+        h.run_steps(2);
+        h.get_by_label("Automatic").click();
+        settle(&mut h);
+        let now = h.state().body().unwrap_or_default().to_string();
+        assert!(!now.contains("color: #c00000") && now.contains("#ffff00"), "html={html}:\n{now}");
+        ask(&mut h, "ui.key", json!({"key": "Z", "ctrl": true})).expect("undo");
+        settle(&mut h);
+        assert!(h.state().body().unwrap_or_default().contains("#c00000"), "html={html}: undo brings the colour back");
+    }
 }

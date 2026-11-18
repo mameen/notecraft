@@ -46,6 +46,12 @@ narrower than 600 points, on Android, a narrow desktop window or the browser bui
 
 ## Product
 
+- **Portable sharing uses a save-and-share fallback.** File > Export, File > Share and
+  Home > Send Page share a reviewed, original-format folder export. Download-enabled
+  browser hosts receive a ZIP. Native share sheets and automatic mail attachments are
+  not integrated yet on any native platform. No OneNote or PDF writer is advertised.
+  See [portable-export.md](portable-export.md) for scope, dependencies and limits.
+
 - **Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V reach the words**, from 2026-10-19. None of them was
   bound anywhere in the window before that: a left-to-right paragraph is an egui text box
   and egui answered them by itself, so the gap only showed where egui was not drawing. That
@@ -76,10 +82,12 @@ narrower than 600 points, on Android, a narrow desktop window or the browser bui
   that the original page boundaries are unavailable. Unsupported HTML remains read-only.
   Sections keep the order the notebook's `.onetoc2` gives them, and OneNote's
   `OneNote_RecycleBin` of deleted sections is left out.
-  Still missing: ink, tags, page dates, password-protected sections, and files in OneNote's
-  OneDrive packaging ([MS-ONESTORE] 2.8 over [MS-FSSHTTPB]): the format of notebooks
-  downloaded from OneDrive and of OneNote for Windows 10. Such a section is named in the
-  report as being in that format, and is given to the OfficeIMO bridge when one is installed.
+  Sections and tables of contents in OneNote's OneDrive packaging ([MS-ONESTORE] 2.8 over
+  [MS-FSSHTTPB]), the format of notebooks downloaded from OneDrive and of OneNote for
+  Windows 10, are read too (`crates/onenote/src/packaged.rs`). Only the current version of
+  each page is read; a data element split into fragments is skipped, and a cloud file card
+  (a link to a file on OneDrive) has no bytes in the file to bring over.
+  Still missing: ink, tags, page dates and password-protected sections.
   Underline and equation structure have nowhere to go in the page formats.
 - **Equations are KaTeX's TeX, not all of LaTeX.** No packages, no chemistry (`\ce`), no TikZ, and
   no visual formula editor. The engine (RaTeX) is young and has one main author; it is pinned to
@@ -446,9 +454,26 @@ narrower than 600 points, on Android, a narrow desktop window or the browser bui
   Alt+1 to Alt+9 pick up the
   pen in that place on the rack, from anywhere, so a tablet's express keys can be bound to
   pens; Alt+0 puts the pen down and goes back to typing. OneNote has no such keys.
-  **Not built:** automatic shapes; the ruler and other stencils;
-  ink replay; ink to text and ink to math; laser pointer; More Colours and the eyedropper
-  in the tool editor. Pressure is real and measured on Windows (hardest 0.930 over 1223
+  Draw > Ruler lays a straightedge on the page (issue #293): drag it to move it, drag its round
+  handle or press [ and ] (Shift for 15 degrees) to turn it, and press the button again to put
+  it away. A stroke begun just outside one of its long edges is laid along that edge, so it
+  comes out straight. The ruler is not page content and is not saved; it lies where it was put
+  until it is put away. Only mouse and pen are handled: there is no two-finger turn yet.
+  When a pen is lifted, the hand's tremor is taken out of the stroke (at most a third of a
+  point, or an eighth of a wide nib), and a wide nib's edges follow the line over a quarter of
+  its width, so a highlighter's edges no longer zigzag (issue #44). Draw > Ink Help opens the
+  Welcome notebook's handwriting page in the interface language, or English (issue #296).
+  Draw > Automatic Shapes (issue #294), when on, redraws a plain line, a rectangle with sides
+  along the page, an ellipse with axes along the page, or a triangle as a clean shape when the
+  pen is lifted, keeping the pen, colour, width and place. Recognition is strict: anything in
+  doubt (writing, a star, a rounded or turned box) stays as drawn, and one Undo brings back
+  what the hand drew. A stroke laid along the ruler is not reread. The choice is kept.
+  Draw > Ink Replay (issue #295) draws the page's strokes again in the order they were drawn,
+  with play and pause (Space), restart, a stroke back or forward, and 0.5x to 4x. The ink file
+  keeps the order of strokes but no times, so every stroke replays at an even speed; the replay
+  changes nothing and takes no part in undo. It replays the whole page, not a selection.
+  **Not built:** other stencils (protractor); ink to text and ink to math; More Colours in the
+  tool editor; replaying only selected ink. Pressure is real and measured on Windows (hardest 0.930 over 1223
   readings, 2026-10-18); on macOS, Linux and Wayland winit drops the tablet fields, so a
   pen there draws at full pressure like a mouse, and tilt and the eraser end are on no
   platform. `cargo run -p notecraft --example pen_check` shows what a pen reports.
@@ -527,6 +552,26 @@ narrower than 600 points, on Android, a narrow desktop window or the browser bui
   them up, never past the top of the page; a guide shows the line and the band of room, Esc
   puts the tool down, and one drag is one step of Undo. It moves boxes, as OneNote moves its
   containers: it does not open a gap between two lines inside one box.
+- **Insert > Online Video** puts a link to the video at the caret (issue #284): YouTube and
+  Vimeo addresses are tidied to their watch page, any other `https` address is kept as it was
+  pasted. Nothing is embedded, loaded or played in the window; the video opens in the browser
+  when the link is clicked. No preview picture is kept.
+- **View > Immersive Reader** shows the open page as plain reading with text size, line
+  spacing and a line focus (issue #299). Boxes are read in the order the page keeps them;
+  pictures are named by their description and handwriting is said to be there but not shown.
+  **Not built:** reading aloud (no speech service on any platform), reading colours other than
+  the theme's, and a per-word focus.
+- **Font Colour and Text Highlight Colour** (issue #260) on Home colour the selected words, or
+  what is typed next at the caret, with ten text colours and six highlights; Automatic and No
+  Colour take them off. The exact `#rrggbb` is kept in both formats as a NoteCraft inline
+  `<span style="color: ...; background-color: ...">`; other colour notations from other
+  programs (names, `rgb()`) are not read. On screen a colour too faint for the theme is moved
+  towards the theme's text colour and a highlight is washed on dark themes; the file keeps the
+  chosen value. Not built: More Colors, and colours inside table cells.
+- **View > Tabs layout** (issues #268, #33) shows the open notebook's sections as coloured tabs
+  over the page, with a section group as a tab that lists its sections. The tree stays in the
+  side panel. Not built: OneNote's vertical tabs on the right and a notebook list across the
+  top; the tabs are hidden in the narrow phone layout.
 - **Unread and author history** are not built. Page version
   history stores snapshots of the page's main file; changes to attached files and drawings
   are not captured by those snapshots. (Tags are: to-do boxes and the other familiar marks,

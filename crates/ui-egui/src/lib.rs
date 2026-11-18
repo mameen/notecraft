@@ -46,22 +46,28 @@ pub mod input_language {
 pub mod inkpad;
 pub mod mathview;
 pub mod navhistory;
+pub mod onlinevideo;
 pub mod pageedit;
 pub mod pagemenu;
 pub mod pagetext;
 pub mod paper;
 pub mod pictures;
+pub mod portable;
 pub mod preview;
 pub(crate) mod printout;
 pub mod quickaccess;
+pub mod reader;
+pub mod replay;
 pub mod ribbon;
 pub mod ribbon_icons;
 pub mod saver;
+pub mod sectiontabs;
 pub mod snippets;
 pub mod stylus;
 pub mod telemetry_export;
 #[cfg(test)]
 mod testing_dir;
+pub mod textcolour;
 pub mod theme;
 
 pub use app::NoteCraftApp;
