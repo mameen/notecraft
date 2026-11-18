@@ -42,6 +42,19 @@ use web_time::Instant;
 /// The grid boxes snap to on plain paper, in page points: the smallest squared paper's step.
 const PLAIN_SNAP_STEP: f32 = 12.0;
 const AUTOSAVE_AFTER: Duration = Duration::from_millis(900);
+#[cfg(feature = "voice")]
+mod voice;
+/// The zoom, and how far down the last page was scrolled, when the window was closed.
+const LAST_ZOOM_KEY: &str = "last_zoom";
+const LAST_SCROLL_KEY: &str = "last_scroll";
+/// How long after the last change to the ink it is written, once the pen is up. A write on a
+/// synced folder waits on the mount; made after every stroke on the window's thread, the next
+/// stroke waited for it.
+const INK_SAVE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A write of the ink under way: the file, how many changes it holds, whether the file was there
+/// before, and where its result comes back.
+type InkSaving = (PathBuf, u64, bool, std::sync::mpsc::Receiver<std::io::Result<crate::inkpad::Written>>);
 /// The three-bar button: what OneNote puts at the top left of the navigation pane.
 const BARS: &str = "\u{2630}";
 /// The ArtCraft community chat. Opened in the browser, never fetched by the app.
@@ -173,7 +186,7 @@ fn missing_attachment_icon(page: &Path, src: &str) -> Option<String> {
     // details when the attachment they belong to is present.
     if let Some((source, extension)) = name.rsplit_once('.')
         && matches!(extension.to_ascii_lowercase().as_str(), "png" | "svg")
-        && page.join("assets").join(source).is_file()
+        && crate::fscache::is_file(&page.join("assets").join(source))
     {
         return None;
     }
@@ -182,7 +195,7 @@ fn missing_attachment_icon(page: &Path, src: &str) -> Option<String> {
     }
     // A missing attachment is not a missing-icon case. Do not warn about an icon
     // when the original file itself is no longer present.
-    if !page.join("assets").join(name).is_file() {
+    if !crate::fscache::is_file(&page.join("assets").join(name)) {
         return None;
     }
     (!attachment_icon_healthy(page, name)).then(|| name.to_string())
@@ -204,7 +217,9 @@ fn attachment_icon_exists(page: &Path, name: &str) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        page.join("assets").join(format!("{name}.svg")).is_file() || page.join("assets").join(format!("{name}.png")).is_file()
+        // Asked every frame while a page is open: see `fscache`.
+        crate::fscache::is_file(&page.join("assets").join(format!("{name}.svg")))
+            || crate::fscache::is_file(&page.join("assets").join(format!("{name}.png")))
     }
 }
 
@@ -512,6 +527,7 @@ struct PendingFormat {
 }
 
 struct Editor {
+    generation: u64,
     dir: PathBuf,
     format: PageFormat,
     title: String,
@@ -1081,7 +1097,11 @@ pub struct NoteCraftApp {
     native_hosted: bool,
     native_close: std::cell::Cell<bool>,
     page_revision: Option<crate::windows::Revision>,
+    /// When, on the window's clock, the page was last checked for another window's writes.
+    changes_checked_at: Option<f64>,
     page_conflict: bool,
+    #[cfg(feature = "voice")]
+    voice: voice::VoiceUi,
     session: Session,
     /// Writes autosaves off the window's thread (see [`crate::saver`]).
     saver: crate::saver::Saver,
@@ -1099,6 +1119,13 @@ pub struct NoteCraftApp {
     qat: quickaccess::Config,
     /// When the pen last changed the page, to tell which Undo should take back.
     last_ink_change: Option<Instant>,
+    /// The ink being written off the window's thread: the file, how many changes the write
+    /// holds, whether the file was there before, and where the result comes back.
+    ink_saving: Option<InkSaving>,
+    /// How many changes have been made to the ink, so a write knows whether it holds them all.
+    ink_changes: u64,
+    /// When the ink is next written: a moment after the last change, once the pen is lifted.
+    ink_save_at: Option<Instant>,
     /// What each Undo took back, newest last, so Redo puts it back the same way.
     undone: Vec<Undone>,
     /// Two columns in the side panel (organisers, then pages) instead of one tree.
@@ -1164,6 +1191,20 @@ pub struct NoteCraftApp {
     page_rect: Option<egui::Rect>,
     /// The canvas translation in screen points. It is UI state, so it never changes page data.
     canvas_pan: egui::Vec2,
+    /// The page carrying on after a swipe on a touchpad.
+    fling: crate::fling::Fling,
+    /// How far down the page is scrolled, as last drawn, and where to scroll it in the next pass:
+    /// a fling going down the page, or a zoom keeping the spot under the pointer.
+    page_offset_y: f32,
+    /// How far down the page could be scrolled, as last drawn.
+    page_offset_max: f32,
+    scroll_to: Option<f32>,
+    /// A pinch or Ctrl+wheel zoom keeps the spot under the pointer where it is: the pointer, and
+    /// the point of the page under it in page points, from the frame the zoom changed in.
+    zoom_anchor: Option<(egui::Pos2, egui::Vec2)>,
+    /// What a pinch moved the zoom by that is less than a whole percent, kept for the next
+    /// update of the pinch, so a slow pinch zooms as a quick one does instead of not at all.
+    zoom_rest: f32,
     /// Last middle-button position while panning the canvas.
     canvas_drag: Option<egui::Pos2>,
     /// Words typed while a pen was in hand, held for the caret's line until it has the keyboard
@@ -1174,6 +1215,12 @@ pub struct NoteCraftApp {
     collect_pending: bool,
     /// The page's sideways scroll bar and its thumb, when one was drawn last frame (issue #188).
     page_hbar: Option<(egui::Rect, egui::Rect)>,
+    /// The part of the page the window shows, and how far the page's content reaches sideways on
+    /// screen, as last drawn: where a pinch or a wheel acts on the page, and how far a sideways
+    /// wheel may pan it. `page_rect` is one view tall from the top of the page, which a page
+    /// scrolled down leaves above the window.
+    page_view: Option<egui::Rect>,
+    page_hspan: Option<(f32, f32)>,
     /// The page ScrollArea's vertical bar hit strip from last frame, kept out of the ink layer.
     page_scroll_strip: Option<egui::Rect>,
     /// True while Insert Space is in hand: the next drag on the page adds or takes away room.
@@ -1256,6 +1303,10 @@ pub struct NoteCraftApp {
     focus_search: bool,
     /// The page the window closed on has been opened again (once per run).
     restored: bool,
+    /// How far down the open page should be scrolled once it is drawn, coming back to where the
+    /// window was left, with how many frames that is still tried for (a page's height is known
+    /// only once it is drawn).
+    restore_scroll: Option<(f32, u32)>,
     /// Recovery warnings that were already shown during this run.
     icon_recovery_reported: HashSet<String>,
     /// Suppress further missing-icon warnings during this run.
@@ -1288,6 +1339,8 @@ impl NoteCraftApp {
         // The installed fonts are read in the background, so the window opens at once.
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         crate::fonts::start_catalog();
+        #[cfg(feature = "voice")]
+        let voice = voice::VoiceUi::new(&session.settings);
         let mode_pref = session.settings.get("theme_mode").and_then(|v| ModePref::parse(&v)).unwrap_or(ModePref::System);
         let ui_language =
             session.settings.get("ui_language").map(|value| crate::i18n::normalize_preference(&value)).unwrap_or_else(|| crate::i18n::AUTO.into());
@@ -1333,6 +1386,9 @@ impl NoteCraftApp {
             nav: NavHistory::default(),
             qat,
             last_ink_change: None,
+            ink_saving: None,
+            ink_changes: 0,
+            ink_save_at: None,
             undone: Vec::new(),
             open: HashSet::new(),
             selected: None,
@@ -1358,6 +1414,7 @@ impl NoteCraftApp {
             native_hosted: false,
             native_close: std::cell::Cell::new(false),
             page_revision: None,
+            changes_checked_at: None,
             page_conflict: false,
             search: String::new(),
             searched: String::new(),
@@ -1387,8 +1444,16 @@ impl NoteCraftApp {
             stylus: crate::stylus::Stylus::default(),
             page_rect: None,
             canvas_pan: egui::Vec2::ZERO,
+            fling: crate::fling::Fling::default(),
+            page_offset_y: 0.0,
+            page_offset_max: 0.0,
+            scroll_to: None,
+            zoom_anchor: None,
+            zoom_rest: 0.0,
             collect_pending: false,
             page_hbar: None,
+            page_view: None,
+            page_hspan: None,
             page_scroll_strip: None,
             space_tool: false,
             ruler: false,
@@ -1414,6 +1479,7 @@ impl NoteCraftApp {
             ribbon_peek: false,
             band_bottom: 0.0,
             zoom_percent: 100,
+            restore_scroll: None,
             fit_page_width: false,
             theme_window: false,
             pending_copy: None,
@@ -1438,6 +1504,8 @@ impl NoteCraftApp {
             queued_alerts: VecDeque::new(),
             clipboard: Box::new(crate::clipboard::System),
             open_attachment_warning_suppressed: false,
+            #[cfg(feature = "voice")]
+            voice,
             welcome_notebook_setup: None,
         }
     }
@@ -1522,31 +1590,72 @@ impl NoteCraftApp {
             return;
         }
         self.restored = true;
+        // The zoom the window was left at.
+        if let Some(zoom) = self.session.settings.get(LAST_ZOOM_KEY).and_then(|z| z.trim().parse::<u32>().ok()).filter(|z| (50..=250).contains(z)) {
+            self.zoom_percent = zoom;
+        }
         let Some(saved) = self.session.settings.get("last_page") else { return };
-        let path = self.session.root().join(saved.trim().replace('/', std::path::MAIN_SEPARATOR_STR));
+        let saved = saved.trim();
+        // A page in a notebook kept outside the notebooks folder is remembered by its whole path.
+        let path = if Path::new(saved).is_absolute() {
+            PathBuf::from(saved)
+        } else {
+            self.session.root().join(saved.replace('/', std::path::MAIN_SEPARATOR_STR))
+        };
         if !path.is_dir() {
             return;
         }
-        // Open every container above it, so the page is visible in the tree.
+        // Open every container above it, up to the notebook it is in, so the page is visible in
+        // the tree.
+        let notebooks: Vec<PathBuf> = self.session.tree().iter().map(|n| n.path.clone()).collect();
         let mut at = path.parent();
         while let Some(dir) = at {
-            if !dir.starts_with(self.session.root()) || dir == self.session.root() {
+            if dir == self.session.root() {
                 break;
             }
             self.open.insert(dir.to_path_buf());
+            if notebooks.iter().any(|n| n == dir) {
+                break;
+            }
             at = dir.parent();
         }
         self.open_page(&path);
+        // Scrolled to where it was.
+        if let Some(y) = self.session.settings.get(LAST_SCROLL_KEY).and_then(|y| y.trim().parse::<f32>().ok()).filter(|y| y.is_finite() && *y > 0.0) {
+            // Pictures may take a while to arrive from a synced folder, and the page is only as
+            // tall as what has arrived: it is tried for a few seconds.
+            self.restore_scroll = Some((y, 300));
+        }
+    }
+
+    /// What the window keeps of where it was left when it closes: the open page written, the zoom,
+    /// and how far down the page is scrolled.
+    pub fn before_close(&mut self) {
+        self.save_now();
+        if self.secondary_window {
+            return;
+        }
+        let _ = self.session.settings.set(LAST_ZOOM_KEY, &self.zoom_percent.to_string());
+        let _ = self.session.settings.set(LAST_SCROLL_KEY, &format!("{:.0}", self.page_offset_y.max(0.0)));
     }
 
     /// Remembers which page is open, for the next time the window starts.
     fn remember_last_page(&mut self, dir: &Path) {
+        // A note window of its own is not where the window was left.
         if self.secondary_window {
             return;
         }
-        let Ok(rel) = dir.strip_prefix(self.session.root()) else { return };
-        let value = rel.to_string_lossy().replace('\\', "/");
+        // Inside the notebooks folder by its place there; a notebook kept elsewhere (a synced
+        // folder, say) by the page's whole path, which was not remembered at all before.
+        let value = match dir.strip_prefix(self.session.root()) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => dir.to_string_lossy().into_owned(),
+        };
         let _ = self.session.settings.set("last_page", &value);
+        // A new page starts at its top.
+        if self.restore_scroll.is_none() {
+            self.page_offset_y = 0.0;
+        }
     }
 
     /// Marks a host whose notebook files disappear with the current browser tab.
@@ -2260,7 +2369,11 @@ impl NoteCraftApp {
 
     fn run(&mut self, id: &str, p: &Params) -> Option<Output> {
         self.take_saves(true);
-        match self.run_recording(id, p) {
+        let result = self.run_recording(id, p);
+        // A command may have written, replaced or removed a picture or an attachment: what the
+        // window kept about files is let go, so the page shows the change at once.
+        crate::fscache::forget_all();
+        match result {
             Ok(output) => Some(output),
             Err(e) => {
                 self.fail(&e);
@@ -2626,6 +2739,12 @@ impl NoteCraftApp {
         if typing_elsewhere || self.dialog.is_some() || self.backstage.is_some() {
             return;
         }
+        // Which page is selected, and whether it can be made a subpage, is read from its folder;
+        // that is only worth doing when a key went down. Every frame it read the page and every
+        // page beside it, which on a synced folder held each frame up.
+        if !ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))) {
+            return;
+        }
         let Some(page) = self.selected.clone().filter(|path| notecraft_store::tree::read_node(path).is_some_and(|info| info.kind == NodeKind::Page))
         else {
             return;
@@ -2672,8 +2791,14 @@ impl NoteCraftApp {
 
     /// Opens a page without counting it as a visit: what Back and Forward do.
     fn open_page_inner(&mut self, dir: &Path) {
+        // A page opened is looked at afresh, not through what was kept about the last one's files.
+        crate::fscache::forget_all();
         self.dismiss_search();
         self.page_opened = true;
+        #[cfg(feature = "voice")]
+        {
+            self.voice.editor_epoch = self.voice.editor_epoch.wrapping_add(1);
+        }
         self.save_now();
         if self.is_dirty() || self.page_conflict {
             return;
@@ -2733,6 +2858,7 @@ impl NoteCraftApp {
             // change" rather than a rename to the fallback word itself.
             let title_buf = if page.has_title { page.title.clone() } else { String::new() };
             self.editor = Some(Editor {
+                generation: 0,
                 authors: notecraft_store::authors::of(dir),
                 dir: dir.to_path_buf(),
                 format: page.format,
@@ -2859,6 +2985,9 @@ impl NoteCraftApp {
     /// written: what comes next (another page, closing, a command) may read the file.
     fn save_now(&mut self) {
         self.take_saves(true);
+        // Ink written off the window's thread is finished first, so the change check below sees
+        // the file as this window left it.
+        self.take_ink_save(true);
         self.check_page_changes();
         if self.page_conflict {
             return;
@@ -2895,6 +3024,8 @@ impl NoteCraftApp {
                 }
             }
         }
+        // The ink waits a moment after a stroke to be written; it is written now.
+        self.save_ink_here();
         self.save_pending_title();
     }
 
@@ -3019,6 +3150,7 @@ impl NoteCraftApp {
 
     /// The page text changed: remember to save it, and read the blocks from it again.
     fn mark_dirty(ed: &mut Editor) {
+        ed.generation = ed.generation.wrapping_add(1);
         ed.dirty_since = Some(Instant::now());
         let (blocks, in_the_text) = notecraft_formats::boxes::read(ed.format, &ed.body);
         ed.blocks = blocks;
@@ -3031,6 +3163,7 @@ impl NoteCraftApp {
     /// as they are. Reading them back from the text would throw away an empty new block and
     /// move the caret out from under the user.
     fn mark_dirty_from_blocks(ed: &mut Editor) {
+        ed.generation = ed.generation.wrapping_add(1);
         // A change that leaves the file as it is, or as it is being written (a click on open
         // paper, which only places the cursor), is not a change to save.
         let file_will_hold = ed.saving.as_ref().unwrap_or(&ed.saved_body);
@@ -3697,6 +3830,10 @@ impl NoteCraftApp {
     fn title_band(&mut self, ui: &mut Ui, with_tabs: bool) {
         let t = self.tokens;
         let (tab, source, in_table) = (self.ribbon_tab.clone(), self.show_source, self.caret_in_table());
+        #[cfg(feature = "voice")]
+        let mic = self.dictation_mic();
+        #[cfg(not(feature = "voice"))]
+        let mic = ribbon::Mic::Hidden;
         let title = self.editor.as_ref().map(|e| e.title.trim().to_owned()).filter(|s| !s.is_empty());
         let mut acts = Vec::new();
         let collapsed = self.ribbon_folded();
@@ -3704,7 +3841,7 @@ impl NoteCraftApp {
             ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
             self.title_row(ui, title.as_deref());
             if with_tabs {
-                ribbon::tab_strip(ui, &tab, source, in_table, collapsed, &t, &mut acts);
+                ribbon::tab_strip(ui, &tab, source, in_table, collapsed, mic, &t, &mut acts);
             }
         });
         self.band_bottom = band.response.rect.max.y;
@@ -4021,6 +4158,11 @@ impl NoteCraftApp {
                 backstage::Act::CheckForUpdates => crate::update::start(ui.ctx().clone(), self.update.clone()),
                 backstage::Act::OpenReleases => ui.ctx().open_url(egui::OpenUrl::new_tab(backstage::LATEST_RELEASE)),
                 backstage::Act::ResetPreferences => self.dialog = Some(Dialog::ResetPreferences),
+                #[cfg(feature = "voice")]
+                backstage::Act::DictationSetup => {
+                    self.backstage = None;
+                    self.open_dictation_setup();
+                }
                 backstage::Act::ExportTelemetry(root) => {
                     if let Some(session) = std::fs::read_dir(&root)
                         .ok()
@@ -4808,6 +4950,10 @@ impl NoteCraftApp {
         match act {
             ribbon::Act::NewWindow => self.request_window(false),
             ribbon::Act::QuickNote => self.request_window(true),
+            #[cfg(feature = "voice")]
+            ribbon::Act::Dictate => self.toggle_dictation(),
+            #[cfg(feature = "voice")]
+            ribbon::Act::DictationSettings => self.open_dictation_setup(),
             ribbon::Act::File => self.backstage = Some("Info"),
             ribbon::Act::SendPage => {
                 let _ = self.session.run("export.cancel", &Params::new());
@@ -5383,6 +5529,100 @@ impl NoteCraftApp {
     /// page without it does not. Without this the source pane showed a page of text while
     /// the page itself was covered in handwriting, and another program opening the folder
     /// would never have known the drawing was there.
+    /// The page names its ink file as the write about to be made will leave it: there once
+    /// something is drawn, gone once the last stroke is. Done in the frame of the change, not
+    /// when the write finishes, so the line in the page changes in the same step as the ink and
+    /// one Undo takes back both.
+    fn expect_ink_file(&mut self) {
+        let (Some(ed), Some(pad)) = (self.editor.as_mut(), self.pad.as_ref()) else { return };
+        let Some(name) = pad.file.file_name().map(|n| n.to_string_lossy().into_owned()) else { return };
+        let drawn = pad.strokes() > 0;
+        let named = ed.ink_files.contains(&name);
+        if drawn && !named {
+            ed.ink_files.push(name);
+            ed.ink_files.sort();
+        } else if !drawn && named {
+            ed.ink_files.retain(|n| *n != name);
+        } else {
+            return;
+        }
+        if Self::name_ink(ed) {
+            Self::mark_dirty_from_blocks(ed);
+        }
+    }
+
+    /// Starts writing the ink off the window's thread, if it has changes.
+    fn start_ink_save(&mut self) {
+        let Some(pad) = self.pad.as_ref().filter(|p| p.dirty) else { return };
+        let write = pad.prepare_save();
+        let (file, had) = (write.file.clone(), pad.on_disk());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("notecraft-ink-save".into()).spawn(move || {
+            let _ = tx.send(write.run());
+        });
+        match spawned {
+            Ok(_) => self.ink_saving = Some((file, self.ink_changes, had, rx)),
+            // No thread to be had: written here, as it always was.
+            Err(_) => self.save_ink_here(),
+        }
+    }
+
+    /// Takes in the ink write under way once it is done, or, with `wait`, waits for it.
+    fn take_ink_save(&mut self, wait: bool) {
+        let Some((file, changes, had, rx)) = self.ink_saving.take() else { return };
+        let result = if wait {
+            rx.recv().ok()
+        } else {
+            match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.ink_saving = Some((file, changes, had, rx));
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        let Some(result) = result else {
+            self.complain(&crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", "the write stopped")]));
+            return;
+        };
+        // The page may have changed meanwhile: a write is taken in only by the drawing it was of.
+        let current = changes == self.ink_changes;
+        let Some(pad) = self.pad.as_mut().filter(|p| p.file == file) else { return };
+        let now = result.as_ref().ok().map(crate::inkpad::Written::on_disk);
+        // Written in the background, quietly: what the window said about the stroke (a shape
+        // it was taken for) is not written over a moment later. A write that failed says so.
+        if let Err(e) = pad.apply_save(result, current) {
+            self.complain(&crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", &e.to_string())]));
+        }
+        self.tell_kept_ink();
+        // The page names its ink file: only a file that came or went changes that.
+        if now.is_some_and(|now| now != had) {
+            self.sync_ink_reference();
+        }
+    }
+
+    /// Writes the ink now, on this thread, after any write under way: for when it must be on
+    /// disk before something else happens (another page, closing, a command).
+    fn save_ink_here(&mut self) {
+        self.take_ink_save(true);
+        self.ink_save_at = None;
+        if self.page_conflict {
+            return;
+        }
+        let Some(pad) = self.pad.as_mut().filter(|p| p.dirty) else { return };
+        let had = pad.on_disk();
+        let strokes = pad.strokes();
+        match pad.save() {
+            Ok(()) => self.say(crate::i18n::format_message_id("ui.drawing_saved_count_strokes", &[("count", &strokes.to_string())])),
+            Err(e) => self.complain(&crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", &e.to_string())])),
+        }
+        self.tell_kept_ink();
+        if self.pad.as_ref().is_some_and(|p| p.on_disk() != had) {
+            self.sync_ink_reference();
+        }
+    }
+
     fn sync_ink_reference(&mut self) {
         let Some(ed) = self.editor.as_mut() else { return };
         // The folder is asked again: the pen has just written or deleted a file.
@@ -5482,6 +5722,8 @@ impl NoteCraftApp {
 
     /// Puts back the change to the drawing that undo last took back.
     fn ink_redo(&mut self) {
+        // A write of the ink under way is finished before the drawing changes under it.
+        self.take_ink_save(true);
         let Some(pad) = self.pad.as_mut() else {
             self.say(crate::tl_id!("ui.nothing_to_redo"));
             return;
@@ -5500,6 +5742,8 @@ impl NoteCraftApp {
 
     /// Takes the last stroke back out of the drawing on this page.
     fn ink_undo(&mut self) {
+        // A write of the ink under way is finished before the drawing changes under it.
+        self.take_ink_save(true);
         let Some(pad) = self.pad.as_mut() else {
             self.say(crate::tl_id!("ui.there_is_no_drawing_on_this_page"));
             return;
@@ -5760,6 +6004,7 @@ impl NoteCraftApp {
                 let step = if back { ed.history.undo().cloned() } else { ed.history.redo().cloned() };
                 match step {
                     Some(step) => {
+                        ed.generation = ed.generation.wrapping_add(1);
                         ed.body = step.body;
                         ed.blocks = step.blocks;
                         ed.boxes = step.boxes;
@@ -8270,9 +8515,17 @@ impl NoteCraftApp {
     /// Where a new section goes: the notebook or section group the chosen section or page is in,
     /// a section group that is itself chosen, or else the first notebook. `None` with no notebook.
     fn new_section_parent(&self) -> Option<(PathBuf, NodeKind)> {
+        // Asked every frame the side panel is drawn, so it reads the tree the window holds,
+        // not the folders: read from disk it was the page and every folder above it, a frame,
+        // which on a synced folder held each frame up.
+        fn kind_in(nodes: &[notecraft_store::tree::Node], path: &Path) -> Option<NodeKind> {
+            let node = nodes.iter().find(|n| path.starts_with(&n.path))?;
+            if node.path == path { Some(node.info.kind) } else { kind_in(&node.children, path) }
+        }
+        let tree = self.session.tree();
         let mut at = self.selected.clone().or_else(|| self.editor.as_ref().map(|e| e.dir.clone()));
         while let Some(path) = at {
-            match notecraft_store::tree::read_node(&path).map(|n| n.kind) {
+            match kind_in(tree, &path) {
                 Some(kind @ (NodeKind::Notebook | NodeKind::SectionGroup)) => return Some((path, kind)),
                 Some(_) => at = path.parent().map(Path::to_path_buf),
                 None => break,
@@ -8448,7 +8701,9 @@ impl NoteCraftApp {
         if modifiers.shift {
             return egui::vec2(delta.y, 0.0);
         }
-        if canvas_pan_enabled { delta } else { egui::Vec2::ZERO }
+        // With the caret's pointer the page's own scroll bar takes the wheel up and down, and a
+        // sideways swipe pans the page sideways, as the horizontal scroll bar does.
+        if canvas_pan_enabled { delta } else { egui::vec2(delta.x, 0.0) }
     }
 
     fn editor_ui(&mut self, ui: &mut Ui) {
@@ -8463,34 +8718,76 @@ impl NoteCraftApp {
                 self.dialog = Some(Dialog::MissingAttachmentIcon { page: ed.dir.clone(), name });
             }
         }
-        let page_input_rect = self.page_rect;
+        // Where a pinch or a wheel acts on the page: the part of it the window shows.
+        let page_input_rect = self.page_view.or(self.page_rect);
         let wheel_canvas_pan_enabled = self.pointer != ribbon::Pointer::Write;
         if self.editor.is_some() && !self.show_source {
             // Draw > Panning Hand: the main button drags the page as the middle one always does
             // (issue #270), but not from the scroll bar, which keeps its own drag.
             let hand = self.pointer == ribbon::Pointer::Pan;
             let bar = self.page_scroll_strip;
+            let view_height = page_input_rect.map_or(600.0, |r| r.height());
+            let line = ui.ctx().options(|o| o.input_options.line_scroll_speed);
+            let fling = &mut self.fling;
             let (pointer, middle_pressed, middle_down, wheel) = ui.input(|i| {
                 let pointer = page_input_rect.and_then(|rect| i.pointer.interact_pos().filter(|p| rect.contains(*p)));
-                let wheel = if page_input_rect.is_some_and(|rect| i.pointer.hover_pos().is_some_and(|p| rect.contains(p))) {
-                    i.events.iter().fold(egui::Vec2::ZERO, |sum, event| match event {
-                        egui::Event::MouseWheel { delta, modifiers, .. } => {
-                            sum + Self::wheel_canvas_pan_delta(*delta, *modifiers, wheel_canvas_pan_enabled)
+                // A click, a pinch or a key stops a fling where it is.
+                if i.pointer.any_pressed() || (i.zoom_delta() - 1.0).abs() > 0.0001 {
+                    fling.stop();
+                }
+                let over = page_input_rect.is_some_and(|rect| i.pointer.hover_pos().is_some_and(|p| rect.contains(p)));
+                let mut wheel = egui::Vec2::ZERO;
+                for event in &i.events {
+                    let egui::Event::MouseWheel { unit, delta, phase, modifiers, .. } = event else { continue };
+                    // A notch of a mouse wheel is a line, not a point: a line is as far as the
+                    // page's own scroll bar takes it, so the wheel pans as fast as it scrolls.
+                    let delta = match unit {
+                        egui::MouseWheelUnit::Point => *delta,
+                        egui::MouseWheelUnit::Line => *delta * line,
+                        egui::MouseWheelUnit::Page => *delta * view_height,
+                    };
+                    if over {
+                        wheel += Self::wheel_canvas_pan_delta(delta, *modifiers, wheel_canvas_pan_enabled);
+                    }
+                    // Fingers on a touchpad: the page carries on when they lift.
+                    if *unit == egui::MouseWheelUnit::Point && !modifiers.ctrl && !modifiers.command {
+                        match phase {
+                            egui::TouchPhase::End => fling.lift(i.time),
+                            egui::TouchPhase::Cancel => fling.stop(),
+                            _ if over && delta != egui::Vec2::ZERO => {
+                                fling.finger(i.time, if modifiers.shift { egui::vec2(delta.y, 0.0) } else { delta })
+                            }
+                            _ => {}
                         }
-                        _ => sum,
-                    })
-                } else {
-                    egui::Vec2::ZERO
-                };
+                    }
+                }
                 let pointer = pointer.filter(|p| !(hand && bar.is_some_and(|b| b.contains(*p))));
                 let pressed = i.pointer.button_pressed(egui::PointerButton::Middle) || (hand && i.pointer.primary_pressed());
                 let down = i.pointer.button_down(egui::PointerButton::Middle) || (hand && i.pointer.primary_down());
                 (pointer, pressed, down, wheel)
             });
+            // The fling goes where the fingers took the page: down it by its scroll bar with the
+            // caret's pointer, and sideways the way a sideways swipe goes.
+            let now = ui.input(|i| i.time);
+            let carried = self.fling.step(now);
+            if self.fling.moving() {
+                ui.ctx().request_repaint();
+            }
+            let carried_down = if wheel_canvas_pan_enabled { 0.0 } else { carried.y };
+            let wheel = wheel + egui::vec2(carried.x, carried.y - carried_down);
+            if carried_down != 0.0 {
+                self.scroll_to = Some((self.page_offset_y - carried_down).max(0.0));
+            }
             if wheel_canvas_pan_enabled {
                 self.canvas_pan += wheel;
                 self.canvas_pan.x = self.canvas_pan.x.clamp(-1.0e6, 1.0e6);
                 self.canvas_pan.y = self.canvas_pan.y.clamp(-1.0e6, 1.0e6);
+            } else if wheel.x != 0.0
+                && let (Some(span), Some(view)) = (self.page_hspan, self.page_view)
+                && let Some(thumb) = crate::hscroll::thumb(span, (view.min.x, view.max.x), view.width())
+            {
+                // Sideways, as far as the page reaches past the view and no further, as the bar.
+                self.canvas_pan.x += crate::hscroll::clamp_pan(wheel.x, &thumb);
             }
             if middle_pressed {
                 self.canvas_drag = pointer;
@@ -8505,14 +8802,29 @@ impl NoteCraftApp {
         } else {
             self.canvas_drag = None;
         }
-        let wheel_zoom =
-            ui.input(|i| page_input_rect.and_then(|rect| i.pointer.hover_pos().filter(|p| rect.contains(*p))).map_or(1.0, |_| i.zoom_delta()));
-        if wheel_zoom.is_finite() && (wheel_zoom - 1.0).abs() > 0.001 {
+        let zoom_at = ui.input(|i| page_input_rect.and_then(|rect| i.pointer.hover_pos().filter(|p| rect.contains(*p))));
+        let wheel_zoom = ui.input(|i| zoom_at.map_or(1.0, |_| i.zoom_delta()));
+        if wheel_zoom.is_finite() && (wheel_zoom - 1.0).abs() > 0.0001 {
+            let before = self.zoom_percent;
+            // A pinch comes as many small steps. Each is kept whole, the part of a percent too,
+            // so a slow pinch zooms: rounded at every step, steps under half a percent were lost.
             #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             {
-                self.zoom_percent = (self.zoom_percent as f32 * wheel_zoom).round().clamp(50.0, 250.0) as u32;
+                let exact = ((before as f32 + self.zoom_rest) * wheel_zoom).clamp(50.0, 250.0);
+                self.zoom_percent = exact.round() as u32;
+                self.zoom_rest = exact - self.zoom_percent as f32;
             }
             self.fit_page_width = false;
+            // The page grows or shrinks about the pointer, not about its top left corner.
+            if self.zoom_percent != before
+                && let (Some(at), Some(ed)) = (zoom_at, self.editor.as_ref())
+            {
+                #[allow(clippy::cast_precision_loss)]
+                let old = before as f32 / 100.0;
+                // A zoom already waiting to be put right is measured from where it was.
+                let spot = self.zoom_anchor.filter(|(was, _)| *was == at).map_or((at - ed.origin) / old, |(_, spot)| spot);
+                self.zoom_anchor = Some((at, spot));
+            }
         }
         if self.fit_page_width {
             let width = ui.available_width();
@@ -8565,6 +8877,9 @@ impl NoteCraftApp {
         let mut recognised: Option<&'static str> = None;
         let mut page_rect = None;
         let mut hbar = crate::hscroll::Shown::default();
+        // Coming back to where the window was left: the page is scrolled there once it is drawn.
+        let restore_scroll = if self.editor.is_some() { self.restore_scroll } else { None };
+        let mut scroll_now: Option<f32> = None;
         // What the page's right-click menu asked for, run once the page's borrow is over.
         let mut page_acts: Vec<ribbon::Act> = Vec::new();
         let collect_now = std::mem::take(&mut self.collect_pending);
@@ -8967,7 +9282,19 @@ impl NoteCraftApp {
                     ..egui::containers::scroll_area::ScrollSource::default()
                 };
                 let page_outer = ui.available_rect_before_wrap();
-                let shown = egui::ScrollArea::vertical().id_salt("page-main").auto_shrink([false, false]).scroll_source(scroll).show(ui, |ui| {
+                let mut area = egui::ScrollArea::vertical().id_salt("page-main").auto_shrink([false, false]).scroll_source(scroll);
+                // Within the page: past its end egui springs the page back, with a speed it then
+                // coasts on, and goes on asking for frames.
+                if let Some(y) = self.scroll_to.take() {
+                    area = area.vertical_scroll_offset(y.clamp(0.0, self.page_offset_max));
+                } else if let Some((y, _)) = restore_scroll
+                    // Coming back to where the window was left: only once the page is tall enough
+                    // to be scrolled that far, for the same reason.
+                    && y <= self.page_offset_max + 1.0
+                {
+                    area = area.vertical_scroll_offset(y);
+                }
+                let shown = area.show(ui, |ui| {
                     // On a touch screen two fingers scroll the page. One finger writes,
                     // selects and moves boxes, as the mouse does, so it cannot scroll too.
                     if let Some(touch) = ui.input(|i| i.multi_touch()) {
@@ -8994,11 +9321,37 @@ impl NoteCraftApp {
                     .then(|| egui::Rect::from_x_y_ranges((max_cross - scroll_style.bar_width)..=max_cross, shown.inner_rect.y_range()));
                 // Sideways the page is a canvas: when what is on it reaches past the view's
                 // sides, a bar along the bottom shows it and moves the canvas (issue #188).
+                self.page_view = Some(shown.inner_rect);
+                self.page_hspan = page_span;
                 if let Some(span) = page_span {
                     let view = shown.inner_rect;
                     let vertical = shown.content_size.y > view.height() + 0.5;
                     let reserve = if vertical { ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_outer_margin } else { 0.0 };
                     hbar = crate::hscroll::show(ui.ctx(), egui::Id::new("page-hscroll"), view, span, reserve);
+                }
+                scroll_now = Some(shown.state.offset().y);
+                self.page_offset_y = shown.state.offset().y;
+                self.page_offset_max = (shown.content_size.y - shown.inner_rect.height()).max(0.0);
+                // Zoomed with the pointer on the page: the spot that was under it is moved back
+                // under it, down by scrolling and sideways by the canvas when the page is wider
+                // than the view. This pass, drawn about the corner, is thrown away and drawn again.
+                if let Some((at, spot)) = self.zoom_anchor.take()
+                    && page_span.is_some()
+                {
+                    let off = ed.origin + spot * zoom_scale - at;
+                    if off.y.abs() > 0.5 {
+                        self.scroll_to = Some((shown.state.offset().y + off.y).max(0.0));
+                    }
+                    let view = shown.inner_rect;
+                    if off.x.abs() > 0.5
+                        && let Some(span) = page_span
+                        && let Some(thumb) = crate::hscroll::thumb(span, (view.min.x, view.max.x), view.width())
+                    {
+                        self.canvas_pan.x += crate::hscroll::clamp_pan(-off.x, &thumb);
+                    }
+                    if off.length() > 0.5 {
+                        ui.ctx().request_discard("zoom about the pointer");
+                    }
                 }
             }
             if changed {
@@ -9109,6 +9462,10 @@ impl NoteCraftApp {
         if space_over {
             self.space_tool = false;
         }
+        if let Some(y) = scroll_now {
+            // Tried until the page is there, which may take a frame or two to be tall enough.
+            self.restore_scroll = self.restore_scroll.and_then(|(want, left)| ((y - want).abs() > 1.0 && left > 0).then_some((want, left - 1)));
+        }
         for act in page_acts {
             self.ribbon_act(act);
         }
@@ -9122,14 +9479,21 @@ impl NoteCraftApp {
         {
             pad.settle();
         }
-        if ink_changed && let Some(pad) = self.pad.as_mut() {
-            let strokes = pad.strokes();
-            match pad.save() {
-                Ok(()) => self.say(crate::i18n::format_message_id("ui.drawing_saved_count_strokes", &[("count", &strokes.to_string())])),
-                Err(e) => self.complain(&crate::i18n::format_message_id("ui.cannot_write_the_drawing_error", &[("error", &e.to_string())])),
-            }
-            self.tell_kept_ink();
-            self.sync_ink_reference();
+        // The ink is written a moment after the last change, off the window's thread, once the
+        // pen is lifted: the pen never waits for the disk.
+        if ink_changed {
+            self.ink_changes += 1;
+            self.ink_save_at = Some(Instant::now() + INK_SAVE_AFTER);
+            self.expect_ink_file();
+        }
+        self.take_ink_save(false);
+        let pen_down = ui.input(|i| i.pointer.any_down());
+        if self.ink_saving.is_none() && !pen_down && !self.page_conflict && self.ink_save_at.is_some_and(|at| Instant::now() >= at) {
+            self.ink_save_at = None;
+            self.start_ink_save();
+        }
+        if self.ink_save_at.is_some() || self.ink_saving.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
         if let Some(kind) = recognised {
             self.say(match kind {
@@ -11314,16 +11678,41 @@ impl NoteCraftApp {
 
     pub fn show(&mut self, ui: &mut Ui) {
         self.take_saves(false);
-        self.check_page_changes();
+        // Another window's writes are looked for before anything typed or clicked here is acted
+        // on, and twice a second besides. Not every frame: each look asks the disk about the page
+        // and its ink, and on a synced folder that held up every frame of a scroll or a pinch.
+        let now = ui.input(|i| i.time);
+        let acting = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { pressed: true, .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Cut
+                        | egui::Event::Ime(_)
+                        | egui::Event::PointerButton { pressed: true, .. }
+                )
+            })
+        });
+        let due = acting || self.changes_checked_at.is_none_or(|at| now - at >= 0.5 || now < at);
+        if due {
+            self.changes_checked_at = Some(now);
+            self.check_page_changes();
+        }
         if self.page_conflict {
             self.conflict_screen(ui);
             return;
         }
         ui.push_id(ui.ctx().viewport_id(), |ui| self.show_checked(ui));
+        if !due {
+            return;
+        }
         if self.pad.as_ref().is_some_and(|p| p.dirty) {
             self.check_page_changes();
         }
         if !self.saver.busy()
+            && self.ink_saving.is_none()
             && !self.page_conflict
             && let Some(current) = self.editor.as_ref().and_then(|ed| crate::windows::Revision::read(&ed.dir).ok())
             && let Some(previous) = &self.page_revision
@@ -11416,6 +11805,8 @@ impl NoteCraftApp {
         self.clipboard_keys(ctx);
         self.poll_control(ctx);
         self.poll_import(ctx);
+        #[cfg(feature = "voice")]
+        self.poll_voice(ctx);
         if !self.event_frames.is_empty() {
             ctx.request_repaint();
         }
@@ -11478,6 +11869,8 @@ impl NoteCraftApp {
             self.dialogs(ctx);
             self.import_progress(ctx);
             self.frame_edges(ctx);
+            #[cfg(feature = "voice")]
+            self.show_voice(ctx);
             return;
         }
         self.compact_layout(ctx);
@@ -11503,7 +11896,7 @@ impl NoteCraftApp {
         // Closing the window writes the page first, and waits for an autosave still being
         // written: what was typed in the moment before closing is not lost.
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.save_now();
+            self.before_close();
             if self.is_dirty() || self.page_conflict {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
@@ -11512,6 +11905,8 @@ impl NoteCraftApp {
         if self.saver.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+        #[cfg(feature = "voice")]
+        self.show_voice(ctx);
         if let Some(since) = self.editor.as_ref().and_then(|e| e.dirty_since) {
             // Read once: read twice, the second could be past the wait, and the subtraction
             // below panicked (seen on a slow CI runner).
@@ -12280,6 +12675,122 @@ mod alert_tests {
             h.step();
         }
         (t, page, pdf, h)
+    }
+
+    /// The window opens where it was left: the same page, even in a notebook kept outside the
+    /// notebooks folder (the one in a synced folder, say), at the same zoom and scrolled to the
+    /// same place. A page outside the notebooks folder was never remembered at all, so the window
+    /// always came back to whatever page it had last remembered inside it.
+    /// Coming back to a place further down than the page reaches yet (its pictures still on their
+    /// way, or the page made shorter meanwhile) does not throw the page past its end. Put there,
+    /// it sprang back with a great speed, coasted far from where it was left, and the window went
+    /// on drawing frame after frame with nothing happening.
+    #[test]
+    fn coming_back_further_down_than_the_page_reaches_leaves_the_window_still() {
+        let t = notecraft_store::testing::TempDir::new("reopen-past-the-end");
+        let settings = notecraft_store::Settings::at(t.path().join("settings.toml"));
+        settings.set("privacy_welcome_seen", "true").expect("settings");
+        let mut session = Session::new(&t.path().join("notebooks"), settings.clone()).expect("session");
+        let sample = notecraft_engine::sample::create_sample(&mut session, None).expect("sample");
+        let lines: String = (1..=60).map(|n| format!("<p>line {n}</p>")).collect();
+        let page = sample.html_page.to_string_lossy().into_owned();
+        session.run("page.save", &params(&[("path", &page), ("body", &lines)])).expect("a page");
+        settings.set("last_page", &page).expect("last page");
+        settings.set(LAST_SCROLL_KEY, "100000").expect("far down");
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(1200.0, 760.0))
+            .with_accessibility_check(false)
+            .build_ui_state(|ui, app: &mut NoteCraftApp| app.show(ui), NoteCraftApp::new(session));
+        for _ in 0..20 {
+            h.step();
+        }
+        let (at, end) = (h.state().page_offset_y, h.state().page_offset_max);
+        assert!(at <= end + 1.0, "the page is not past its end: {at} of {end}");
+        assert!(!h.ctx.has_requested_repaint(), "and with nothing happening the window asks for no more frames");
+    }
+
+    #[test]
+    fn the_window_opens_where_it_was_left() {
+        let t = notecraft_store::testing::TempDir::new("reopen-where-left");
+        let settings = notecraft_store::Settings::at(t.path().join("settings.toml"));
+        settings.set("privacy_welcome_seen", "true").expect("settings");
+        let mut session = Session::new(&t.path().join("notebooks"), settings.clone()).expect("session");
+        notecraft_engine::sample::create_sample(&mut session, None).expect("sample");
+        // A notebook elsewhere, opened beside the others, with a long page in it.
+        let away = t.path().join("away");
+        std::fs::create_dir_all(&away).expect("dir");
+        let mut other = Session::new(&away, settings.clone()).expect("other session");
+        let Ok(Output::Path(made)) = other.run("notebook.create", &params(&[("name", "Elsewhere")])) else { panic!("a notebook") };
+        session.run("notebook.open", &params(&[("path", &made.to_string_lossy())])).expect("open it");
+        let page = made.join("new-section-1").join("untitled-page");
+        let lines: String = (1..=120).map(|n| format!("<p>line {n}</p>")).collect();
+        session.run("page.save", &params(&[("path", &page.to_string_lossy()), ("body", &lines)])).expect("a long page");
+
+        let harness = |app: NoteCraftApp| {
+            egui_kittest::Harness::builder()
+                .with_size(vec2(1200.0, 760.0))
+                .with_accessibility_check(false)
+                .build_ui_state(|ui, app: &mut NoteCraftApp| app.show(ui), app)
+        };
+        let mut h = harness(NoteCraftApp::new(session));
+        for _ in 0..5 {
+            h.step();
+        }
+        h.state_mut().open_path(&page.to_string_lossy());
+        h.state_mut().zoom_percent = 150;
+        for _ in 0..5 {
+            h.step();
+        }
+        // Scrolled down with the wheel, over the page.
+        h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(600.0, 400.0)));
+        for _ in 0..6 {
+            h.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, -200.0),
+                modifiers: Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            h.step();
+        }
+        for _ in 0..10 {
+            h.step();
+        }
+        let scrolled = h.state().page_offset_y;
+        assert!(scrolled > 300.0, "the page is scrolled down: {scrolled}");
+        // The window closes.
+        h.state_mut().before_close();
+        drop(h);
+
+        // And opens again, on the same settings.
+        let session = Session::new(&t.path().join("notebooks"), settings.clone()).expect("again");
+        let mut h = harness(NoteCraftApp::new(session));
+        for _ in 0..10 {
+            h.step();
+        }
+        assert_eq!(h.state().editor.as_ref().map(|e| e.dir.clone()), Some(page.clone()), "the same page is open");
+        assert_eq!(h.state().zoom_percent, 150, "at the same zoom");
+        assert!((h.state().page_offset_y - scrolled).abs() < 2.0, "scrolled to the same place: {scrolled} -> {}", h.state().page_offset_y);
+        assert!(h.state().open.contains(&made), "and its notebook is open in the tree");
+    }
+
+    /// Drawing a page does not go to the disk every frame. A page of printouts asked about every
+    /// picture and attachment each frame; on a synced folder (OneDrive through onedriver) each of
+    /// those waits on the mount, and the window drew a few frames a second while scrolling.
+    #[test]
+    fn drawing_a_page_of_printouts_does_not_ask_the_disk_every_frame() {
+        let (_t, page, pdf, mut h) = printout_harness(true, "printout-quiet-frames");
+        h.state_mut().add_file(&page, &pdf, FileChoice::Printout);
+        for _ in 0..5 {
+            h.step();
+        }
+        let before = crate::fscache::disk_asks();
+        for _ in 0..30 {
+            h.step();
+        }
+        let asked = crate::fscache::disk_asks() - before;
+        // Within the cache's moment each file is asked about at most once, not once a frame.
+        assert!(asked <= 12, "30 frames asked the disk {asked} times");
     }
 
     /// Issue #67: with no box holding the caret, a second printout goes below what is already

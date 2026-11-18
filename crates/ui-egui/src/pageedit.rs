@@ -31,6 +31,26 @@ fn spans_of(block: &Block) -> Option<&[Span]> {
 
 use notecraft_model::Tag;
 
+/// Where the caret was drawn this frame: its rectangle, line rectangle, pass and block.
+#[cfg(feature = "voice")]
+pub fn caret_anchor_id() -> egui::Id {
+    egui::Id::new("notecraft-caret-anchor")
+}
+
+/// The room under the page and pass: where appended dictation will appear.
+#[cfg(feature = "voice")]
+pub fn page_end_anchor_id() -> egui::Id {
+    egui::Id::new("notecraft-page-end-anchor")
+}
+
+#[cfg(feature = "voice")]
+fn remember_caret_anchor(ui: &Ui, out: &egui::text_edit::TextEditOutput, caret: &Caret) {
+    let at = caret.selection.0.max(caret.selection.1).min(caret.text.chars().count());
+    let spot = out.galley.pos_from_cursor(egui::text::CCursor::new(at)).translate(out.galley_pos.to_vec2());
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.ctx().data_mut(|d| d.insert_temp(caret_anchor_id(), (spot, out.response.rect, pass, caret.block)));
+}
+
 /// Where a selection that a right click collapsed is to be put back: `(block, primary, secondary)`.
 /// Set by the container, taken by the block's text box on the next frame. A text box moves its
 /// selection to the pointer the moment any button goes down, so a menu that acts on the words
@@ -2189,6 +2209,11 @@ pub fn show(
     let mut changed = show_blocks(ui, blocks, caret, page_dir, t, page, all, cols, justified, across, shown_title, 1.0);
     // Room under the page: a click there writes at the end, the way an empty page does.
     let (_rect, below) = ui.allocate_exact_size(vec2(ui.available_width(), 140.0_f32.min(ui.available_height().max(40.0))), Sense::click());
+    #[cfg(feature = "voice")]
+    {
+        let pass = ui.ctx().cumulative_pass_nr();
+        ui.ctx().data_mut(|d| d.insert_temp(page_end_anchor_id(), (_rect, pass)));
+    }
     if below.clicked() {
         apply(Action::ClickBelow, blocks, caret, &mut changed);
     }
@@ -2279,11 +2304,7 @@ pub fn show_blocks(
         // when the picture is lifted out of the box (see `containers`). Only these are noted, so
         // a long page does not pay for it.
         if i > 0 && matches!(blocks.get(i - 1), Some(Block::Image { .. })) {
-            ui.data_mut(|d| {
-                let mut tops = d.get_temp::<Vec<(usize, f32)>>(after_picture_tops_id()).unwrap_or_default();
-                tops.push((i, top));
-                d.insert_temp(after_picture_tops_id(), tops);
-            });
+            ui.data_mut(|d| d.get_temp_mut_or_default::<Vec<(usize, f32)>>(after_picture_tops_id()).push((i, top)));
         }
         // Except the one blank line of a box just clicked into: there the cursor alone shows
         // where the words will go, until the first is written.
@@ -2536,6 +2557,8 @@ pub fn show_blocks(
                                 .show(ui)
                         })
                     };
+                    #[cfg(feature = "voice")]
+                    remember_caret_anchor(ui, &out, c);
                     let mut cursor_range = out.cursor_range;
                     let (left, right, shift) = ui.input(|input| {
                         let mut left = false;
@@ -2764,7 +2787,7 @@ pub fn show_blocks(
                 && out.task_set.is_none()
                 && let Some(p) = drag_began_in(ui, resp.rect)
             {
-                let at = char_under(ui, &block, &resp, p, t, page);
+                let at = char_under(ui, &block, &resp, p, t, page, zoom);
                 if across.is_none() {
                     *across = Some(Across { from: (i, byte_of_caret(&block, at)), to: (i, byte_of_caret(&block, at)) });
                 }
@@ -2776,7 +2799,7 @@ pub fn show_blocks(
                 && let Some(p) = ui.ctx().pointer_latest_pos()
                 && resp.rect.contains(p)
             {
-                let at = byte_of_caret(&block, char_under(ui, &block, &resp, p, t, page));
+                let at = byte_of_caret(&block, char_under(ui, &block, &resp, p, t, page, zoom));
                 match across.as_mut() {
                     // Already open: this is where it reaches now, the block it began in
                     // included, so dragging back the way it came shortens it again.
@@ -2799,18 +2822,18 @@ pub fn show_blocks(
             } else if (resp.clicked() || resp.double_clicked()) && is_writable(&block) {
                 // A click on a link follows it; anywhere else it puts the caret there.
                 let link = (!contains_inline_image(&block))
-                    .then(|| resp.interact_pointer_pos().and_then(|p| link_under(ui, &block, &resp, p, t, page)))
+                    .then(|| resp.interact_pointer_pos().and_then(|p| link_under(ui, &block, &resp, p, t, page, zoom)))
                     .flatten();
                 match link {
                     Some(href) => changed.link = Some(href),
                     None => {
-                        let at = resp.interact_pointer_pos().map(|p| char_under(ui, &block, &resp, p, t, page));
+                        let at = resp.interact_pointer_pos().map(|p| char_under(ui, &block, &resp, p, t, page, zoom));
                         action = Some(Action::MoveTo(i, at));
                     }
                 }
             }
             if resp.hovered() && is_writable(&block) {
-                let over_link = resp.hover_pos().and_then(|p| link_under(ui, &block, &resp, p, t, page)).is_some();
+                let over_link = resp.hover_pos().and_then(|p| link_under(ui, &block, &resp, p, t, page, zoom)).is_some();
                 ui.ctx().set_cursor_icon(if over_link { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Text });
             }
             frame_block(ui, top, false, t, zoom);
@@ -3803,18 +3826,22 @@ fn apply(action: Action, blocks: &mut Vec<Block>, caret: &mut Option<Caret>, cha
     }
 }
 
-/// The character of a finished block under `pos`, given the area `resp` it was drawn in.
-fn char_under(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t: &Tokens, page: Option<notecraft_model::Dir>) -> usize {
-    if let Some(at) = char_under_drawn(ui, block, resp, pos, t, page) {
+/// The character of a finished block under `pos`, given the area `resp` it was drawn in at
+/// `zoom`. The words are drawn at their size times the zoom, so the pointer is measured in the
+/// page's own points: measured on screen, a click zoomed in put the caret further along the
+/// line than the pointer.
+fn char_under(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t: &Tokens, page: Option<notecraft_model::Dir>, zoom: f32) -> usize {
+    if let Some(at) = char_under_drawn(ui, block, resp, pos, t, page, zoom) {
         return at;
     }
+    let z = zoom.max(0.01);
     let (size, strong) = size_of(block);
-    let offset = pos - resp.rect.min - egui::vec2(lead_width(block), 0.0);
+    let offset = (pos - resp.rect.min) / z - egui::vec2(lead_width(block), 0.0);
     if let Some(spans) = spans_of(block) {
-        return char_at_spans(ui, spans, size, strong, t, resp.rect.width(), offset, page);
+        return char_at_spans(ui, spans, size, strong, t, resp.rect.width() / z, offset, page);
     }
     let text = caret_text(block);
-    char_at(ui, &text, size, strong, t, resp.rect.width(), offset, page)
+    char_at(ui, &text, size, strong, t, resp.rect.width() / z, offset, page)
 }
 
 /// Where a click on a finished block lands in the text the caret writes in.
@@ -3825,7 +3852,15 @@ fn char_under(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t:
 /// the text and invisible on the page. So the pointer is measured against what was drawn and
 /// the answer is carried back over the marks. `None` when that carrying back cannot be
 /// trusted, and the caller measures the old way.
-fn char_under_drawn(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t: &Tokens, page: Option<notecraft_model::Dir>) -> Option<usize> {
+fn char_under_drawn(
+    ui: &Ui,
+    block: &Block,
+    resp: &egui::Response,
+    pos: egui::Pos2,
+    t: &Tokens,
+    page: Option<notecraft_model::Dir>,
+    zoom: f32,
+) -> Option<usize> {
     let spans = match block {
         Block::Heading { spans, .. } | Block::Paragraph(spans) | Block::Quote(spans) | Block::Item { spans, .. } => spans,
         _ => return None,
@@ -3844,9 +3879,11 @@ fn char_under_drawn(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Po
     // A row that reads right to left keeps its bullet and its tag mark on the right, so its
     // words start at the left edge; a row that reads the other way has them after the lead.
     let rtl = preview::dir_of(&spans, page).is_rtl();
-    let rel = pos - resp.rect.min;
+    // In the page's own points, as the words were laid out before the zoom drew them larger.
+    let z = zoom.max(0.01);
+    let rel = (pos - resp.rect.min) / z;
     let x = if rtl { rel.x } else { rel.x - lead };
-    let column = (resp.rect.width() - lead).max(32.0);
+    let column = (resp.rect.width() / z - lead).max(32.0);
     let (size, strong) = size_of(block);
     let at = if crate::bidi::paints(&drawn, page) {
         let byte = crate::bidi::hit(&drawn, vec2(x, rel.y), size, column, page);
@@ -3908,14 +3945,23 @@ fn link_in(block: &Block, at: usize, page: Option<notecraft_model::Dir>) -> Opti
 /// The link under the pointer at `pos` in a finished block, if the pointer is on one. A
 /// right-to-left or mixed line is asked through the painter that drew it; any other line
 /// through egui's layout of its text.
-pub fn link_under(ui: &Ui, block: &Block, resp: &egui::Response, pos: egui::Pos2, t: &Tokens, page: Option<notecraft_model::Dir>) -> Option<String> {
+pub fn link_under(
+    ui: &Ui,
+    block: &Block,
+    resp: &egui::Response,
+    pos: egui::Pos2,
+    t: &Tokens,
+    page: Option<notecraft_model::Dir>,
+    zoom: f32,
+) -> Option<String> {
     if !is_writable(block) {
         return None;
     }
-    if let Some(href) = preview::link_at_point(block, pos - resp.rect.min, resp.rect.width(), page) {
+    let z = zoom.max(0.01);
+    if let Some(href) = preview::link_at_point(block, (pos - resp.rect.min) / z, resp.rect.width() / z, page) {
         return Some(href);
     }
-    link_in(block, char_under(ui, block, resp, pos, t, page), page)
+    link_in(block, char_under(ui, block, resp, pos, t, page, zoom), page)
 }
 
 /// How wide the bullet or quote bar in front of a block is, so a click lands on the right
