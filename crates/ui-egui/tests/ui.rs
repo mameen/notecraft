@@ -2193,7 +2193,8 @@ fn the_caret_lands_in_the_last_word_of_a_line_that_holds_a_link() {
     }
     assert!(h.state().body().is_some_and(|b| b.starts_with("see [the format page]")), "the page stays open: {:?}", h.state().body());
     let at = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/caret/at").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let last_word = body.find("stop").unwrap_or(0);
+    // The caret counts the words on the page, where the link's marks are not words.
+    let last_word = "see the format page and stop".find("stop").unwrap_or(0);
     assert!(at >= last_word, "the caret is in the last word: character {at} of {:?}, which begins at {last_word}", body.trim_end());
 }
 
@@ -4688,7 +4689,7 @@ fn page_shortcuts_work_while_typing_in_the_page_but_not_in_search() {
     // From the page title too: it is the page's own text.
     // The id the window gives the title box (`app.rs`, "page-title-box").
     #[allow(deprecated)]
-    let title = egui::Id::new("page-title-box");
+    let title = egui::Id::new(("page-title-box", h.ctx.viewport_id()));
     h.ctx.memory_mut(|m| m.request_focus(title));
     settle(&mut h);
     assert!(h.ctx.memory(|m| m.has_focus(title)), "the title has the keyboard");
@@ -9170,6 +9171,8 @@ fn formatting_shortcuts_match_existing_table_cell_actions() {
     let mut h = sized_harness(app, LIGHT, egui::vec2(2000.0, 900.0));
     for (page, format) in [(&s.md_page, notecraft_model::PageFormat::Cmgfm), (&s.html_page, notecraft_model::PageFormat::Html)] {
         for key in ["B", "I", "U"] {
+            // Finish the previous case before replacing its real on-disk fixture.
+            h.state_mut().save();
             notecraft_store::page::save_body(
                 page,
                 if format == notecraft_model::PageFormat::Html {
@@ -9526,8 +9529,7 @@ fn home_mark_buttons_show_the_marks_at_the_caret_and_of_the_selection() {
         let on =
             |h: &Harness<'_, NoteCraftApp>, label: &str| h.get_by_label(label).accesskit_node().toggled() == Some(egui::accesskit::Toggled::True);
         // Puts the caret `right` characters into the line and selects `select` more. The line
-        // being written in still shows its marks' markup (`alpha **bravo** *omega*`, issue
-        // #242), and the caret counts through it.
+        // being written in shows only its words (issue #242), and the caret counts them.
         let place = |h: &mut Harness<'_, NoteCraftApp>, right: usize, select: usize| {
             ask(h, "ui.caret", json!({"block": 0})).expect("caret");
             pump(h);
@@ -9549,9 +9551,9 @@ fn home_mark_buttons_show_the_marks_at_the_caret_and_of_the_selection() {
         review(&mut h, &format!("mark_state_bold_{format:?}"));
         place(&mut h, 2, 0);
         assert!(!on(&h, "Bold"), "{format:?}: the caret in alpha shows no mark");
-        place(&mut h, 19, 0);
+        place(&mut h, 14, 0);
         assert!(on(&h, "Italic") && !on(&h, "Bold"), "{format:?}: the caret in omega shows Italic");
-        place(&mut h, 8, 5);
+        place(&mut h, 6, 5);
         assert!(on(&h, "Bold"), "{format:?}: all of bravo selected is bold");
         place(&mut h, 0, 13);
         assert!(!on(&h, "Bold"), "{format:?}: alpha and bravo together are only partly bold");
@@ -9707,7 +9709,7 @@ fn legacy_font_marks_toggle_partial_selection_without_losing_other_styles() {
             pump(&mut h);
             ask(&mut h, "ui.key", json!({"key": "End"})).expect("end");
             pump(&mut h);
-            for _ in 0..10 {
+            for _ in 0..6 {
                 ask(&mut h, "ui.key", json!({"key": "ArrowLeft"})).expect("left");
                 pump(&mut h);
             }
@@ -9804,7 +9806,7 @@ fn font_size_replaces_only_the_partial_selection_inside_an_existing_size() {
     pump(&mut h);
     ask(&mut h, "ui.key", json!({"key": "End"})).expect("end");
     pump(&mut h);
-    for _ in 0..13 {
+    for _ in 0..6 {
         ask(&mut h, "ui.key", json!({"key": "ArrowLeft"})).expect("left");
         pump(&mut h);
     }
@@ -10133,6 +10135,8 @@ fn legacy_font_marks_apply_to_next_typed_text_without_changing_page_first() {
     let mut h = sized_harness(app, LIGHT, egui::vec2(2000.0, 900.0));
     for (page, format) in [(&s.md_page, notecraft_model::PageFormat::Cmgfm), (&s.html_page, notecraft_model::PageFormat::Html)] {
         for label in ["Bold", "Italic", "Strikethrough"] {
+            // Finish the previous case before replacing its real on-disk fixture.
+            h.state_mut().save();
             notecraft_store::page::save_body(page, if format == notecraft_model::PageFormat::Html { "<p>plain</p>" } else { "plain" })
                 .expect("fixture");
             h.state_mut().open_path(&page.to_string_lossy());
@@ -10160,6 +10164,10 @@ fn legacy_font_marks_apply_to_next_typed_text_without_changing_page_first() {
             ask(&mut h, "ui.redo", json!({})).expect("redo");
             settle(&mut h);
             assert_eq!(h.state().body().unwrap_or_default(), after);
+            // Leave the page as it was opened: reopening saves a dirty editor over the
+            // fixture the next pass writes.
+            ask(&mut h, "ui.undo", json!({})).expect("undo to clean");
+            settle(&mut h);
         }
     }
 }
@@ -11140,13 +11148,13 @@ fn not_built_placeholders_are_disabled_for_accessibility() {
     settle(&mut h);
     h.get_by_label("View").click();
     settle(&mut h);
-    for name in ["Dock to desktop", "New window", "New quick note", "Live captions"] {
+    for name in ["Dock to desktop", "Live captions"] {
         let label = format!("{name} (not built)");
         let nodes: Vec<_> = h.query_all_by_label(&label).collect();
         assert!(!nodes.is_empty(), "{label} is listed");
         assert!(nodes.iter().all(|n| n.accesskit_node().is_disabled()), "{label} is reported as unavailable");
     }
-    for working in ["Zoom In", "Zoom Out", "Always on top", "Paper size", "Immersive reader", "Tabs layout"] {
+    for working in ["Zoom In", "Zoom Out", "Always on top", "Paper size", "Immersive reader", "Tabs layout", "New window", "New quick note"] {
         assert!(!h.get_by_label(working).accesskit_node().is_disabled(), "{working} still works");
     }
     // Insert's placeholders were already right and stay so.
@@ -11168,7 +11176,7 @@ fn the_view_tab_has_one_window_group_and_one_entry_per_action() {
     settle(&mut h);
     assert_eq!(h.query_all_by_label("Window").count(), 1, "one Window group");
     assert_eq!(h.query_all_by_label("Always on top (not built)").count(), 0, "Always on top is not called unbuilt");
-    assert_eq!(h.query_all_by_label("New window (not built)").count(), 1, "New window is listed once");
+    assert_eq!(h.query_all_by_label("New window").count(), 1, "New window is listed once");
     assert_eq!(h.query_all_by_label("Dock to desktop (not built)").count(), 1, "Dock to desktop is listed once, in Views");
     h.get_by_label("Always on top").click();
     settle(&mut h);
@@ -12603,4 +12611,196 @@ fn font_colour_and_highlight_colour_the_selected_words_in_both_formats() {
         settle(&mut h);
         assert!(h.state().body().unwrap_or_default().contains("#c00000"), "html={html}: undo brings the colour back");
     }
+}
+
+/// #265 and #266 must be usable actions, rather than unavailable placeholders.
+#[test]
+fn window_capture_actions_are_available_in_view() {
+    let (_t, app, _) = sample_app("window-actions");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1800.0, 1000.0));
+    settle(&mut h);
+    h.get_by_label("View").click();
+    settle(&mut h);
+    assert_eq!(h.query_all_by_label("New window").count(), 1);
+    assert_eq!(h.query_all_by_label("New quick note").count(), 1);
+}
+
+#[test]
+fn window_capture_shortcuts_queue_independent_views_and_quick_notes_persist() {
+    for quick in [false, true] {
+        let (_t, mut app, sample) = sample_app("window-shortcuts");
+        app.open_path(&sample.html_page.to_string_lossy());
+        let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 900.0));
+        settle(&mut h);
+        ask(&mut h, "ui.key", json!({"key":"M", "ctrl":true, "shift":quick})).expect("shortcut");
+        pump(&mut h);
+        let requests = h.state_mut().take_window_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].quick, quick);
+        if !quick {
+            assert_eq!(requests[0].path, sample.html_page);
+        }
+        let mut child = h.state().child_window(&requests[0]).expect("child");
+        assert_eq!(child.current_page(), Some(requests[0].path.as_path()));
+        child.set_body("<p>captured in child</p>");
+        child.save();
+        assert!(!child.is_dirty());
+        assert!(notecraft_store::page::load_page(&requests[0].path).expect("reopen").body.contains("captured in child"));
+        child.open_path(&sample.md_page.to_string_lossy());
+        assert_eq!(h.state().current_page(), Some(sample.html_page.as_path()));
+        drop(child);
+        assert_eq!(h.state().current_page(), Some(sample.html_page.as_path()));
+    }
+}
+
+#[test]
+fn window_capture_keeps_conflicting_unsaved_edits_as_a_separate_page() {
+    for html in [false, true] {
+        let (_t, mut first, sample) = sample_app("window-conflicts");
+        let page = if html { &sample.html_page } else { &sample.md_page };
+        first.open_path(&page.to_string_lossy());
+        let mut second = first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false }).expect("second");
+        first.set_body(if html { "<p>first view</p>" } else { "first view\n" });
+        second.set_body(if html { "<p>second view</p>" } else { "second view\n" });
+        first.save();
+        second.save();
+        assert!(second.has_page_conflict());
+        assert!(second.is_dirty());
+        assert!(second.body().expect("input kept").contains("second view"));
+        assert!(notecraft_store::page::load_page(page).expect("newer").body.contains("first view"));
+        let copy = second.keep_conflicted_copy().expect("keep copy");
+        assert_ne!(&copy, page);
+        assert!(notecraft_store::page::load_page(&copy).expect("copy").body.contains("second view"));
+        assert!(notecraft_store::page::load_page(page).expect("original").body.contains("first view"));
+        assert!(!second.has_page_conflict());
+        assert!(!second.is_dirty());
+    }
+}
+
+#[test]
+fn window_capture_clean_view_reloads_changes_and_missing_pages_keep_unsaved_input() {
+    let (_t, mut first, sample) = sample_app("window-reload");
+    first.open_path(&sample.html_page.to_string_lossy());
+    let mut second = first.child_window(&notecraft_ui_egui::windows::Request { path: sample.html_page.clone(), quick: false }).expect("second");
+    first.set_body("<p>new shared words</p>");
+    first.save();
+    second.check_page_changes();
+    assert!(second.body().expect("new content").contains("new shared words"));
+    assert!(!second.has_page_conflict());
+    second.set_body("<p>unsaved words</p>");
+    std::fs::remove_file(sample.html_page.join("index.html")).expect("external deletion");
+    second.save();
+    assert!(second.has_page_conflict());
+    assert!(second.body().expect("input kept").contains("unsaved words"));
+    assert!(!second.reload_conflicted_page());
+    assert!(second.is_dirty());
+}
+
+#[test]
+fn window_capture_refreshed_caret_uses_the_new_pages_formatting() {
+    for html in [false, true] {
+        let (_t, mut first, sample) = sample_app("window-caret-refresh");
+        let page = if html { &sample.html_page } else { &sample.md_page };
+        first.open_path(&page.to_string_lossy());
+        first.set_body(if html { "<p>seed</p>" } else { "seed\n" });
+        first.save();
+        let second = first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false }).expect("second");
+        let mut h = sized_harness(second, LIGHT, egui::vec2(1500.0, 900.0));
+        settle(&mut h);
+        ask(&mut h, "ui.caret", json!({"block":0})).expect("caret");
+        ask(&mut h, "ui.text", json!({"text":"x"})).expect("hydrate the caret's editing spans");
+        h.state_mut().save();
+        let body = if html { "<p><strong>seedx</strong></p>" } else { "**seedx**\n" };
+        first.session_mut().run("page.save", &params(&[("path", &page.to_string_lossy()), ("body", body)])).expect("peer formatting");
+        h.state_mut().check_page_changes();
+        assert!(!h.state().has_page_conflict());
+        ask(&mut h, "ui.text", json!({"text":"!"})).expect("continue typing after refresh");
+        h.state_mut().save();
+        let loaded = notecraft_store::page::load_page(page).expect("saved page");
+        let blocks = notecraft_formats::boxes::read(loaded.format, &loaded.body).0;
+        let notecraft_formats::Block::Paragraph(spans) = &blocks[0] else { panic!("paragraph") };
+        assert!(spans.iter().any(|span| span.bold && span.text.contains("seedx")), "typing after refresh must retain the peer's formatting");
+    }
+}
+
+#[test]
+fn window_capture_stale_ink_cannot_replace_another_views_drawing() {
+    let t = TempDir::new("window-ink-conflict");
+    let mut first = notecraft_ui_egui::inkpad::Pad::of_page(t.path());
+    let mut second = notecraft_ui_egui::inkpad::Pad::of_page(t.path());
+    let drawing = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/demo/DemoNotebook/html");
+    fn find_ink(dir: &std::path::Path) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(p) = find_ink(&path) {
+                    return Some(p);
+                }
+            } else if path.file_name().is_some_and(|n| n == "ink.svg") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let ink = std::fs::read_to_string(find_ink(&drawing).expect("real ink fixture")).expect("ink");
+    first.drawing = notecraft_ink::svg::read(&ink).expect("drawing").0;
+    first.dirty = true;
+    first.save().expect("first view");
+    let before = std::fs::read(t.path().join("ink.svg")).expect("saved ink");
+    second.dirty = true;
+    assert!(second.save().is_err(), "an old empty drawing cannot delete the newer ink");
+    assert!(second.dirty, "input remains unsaved");
+    assert_eq!(std::fs::read(t.path().join("ink.svg")).expect("preserved ink"), before);
+}
+
+#[test]
+fn window_capture_saves_the_focused_title_before_a_window_transition() {
+    let (_t, mut app, sample) = sample_app("window-title-save");
+    app.open_path(&sample.html_page.to_string_lossy());
+    app.set_body("<p>Body beneath the title.</p>");
+    app.save();
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 900.0));
+    settle(&mut h);
+    h.get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Title").click();
+    pump(&mut h);
+    ask(&mut h, "ui.key", json!({"key":"A", "ctrl":true})).expect("select title");
+    pump(&mut h);
+    ask(&mut h, "ui.text", json!({"text":"A retained window title"})).expect("title text");
+    pump(&mut h);
+    h.state_mut().save();
+    assert_eq!(notecraft_store::tree::read_node(&sample.html_page).expect("saved title").title, "A retained window title");
+    assert!(!h.state().is_dirty());
+}
+
+#[test]
+fn window_capture_queued_autosave_refuses_newer_disk_content() {
+    let (_t, app, sample) = sample_app("window-queued-conflict");
+    let page = &sample.html_page;
+    let original = notecraft_store::page::load_page(page).expect("load").body;
+    let writer = notecraft_store::coordination::writer(app.session().root()).expect("root writer");
+    let guard = writer.lock().expect("pause controller writes");
+    let mut saver = notecraft_ui_egui::saver::Saver::default();
+    assert!(saver.submit_checked(app.session().root(), page, "<p>queued older words</p>", &original));
+    notecraft_store::page::save_body(page, "<p>new external words</p>").expect("external write");
+    drop(guard);
+    let results = saver.wait();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_err());
+    assert!(notecraft_store::page::load_page(page).expect("kept").body.contains("new external words"));
+    drop(app);
+}
+
+#[test]
+fn window_capture_metadata_commands_and_background_body_saves_keep_both_edits() {
+    let (_t, mut app, sample) = sample_app("window-metadata-save");
+    let page = sample.md_page;
+    notecraft_store::page::save_body(&page, "seed words\n").expect("body without a matching title heading");
+    let original = notecraft_store::page::load_page(&page).expect("load").body;
+    let mut saver = notecraft_ui_egui::saver::Saver::default();
+    assert!(saver.submit_checked(app.session().root(), &page, "background words\n", &original));
+    app.session_mut().run("node.title", &params(&[("path", &page.to_string_lossy()), ("title", "Retained title")])).expect("metadata command");
+    assert!(saver.wait().iter().all(|r| r.result.is_ok()));
+    let saved = notecraft_store::page::load_page(&page).expect("page");
+    assert_eq!(saved.title, "Retained title");
+    assert!(saved.body.contains("background words"));
 }
