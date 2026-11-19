@@ -1050,6 +1050,8 @@ enum Act {
     PromoteSubpage(PathBuf),
     MovePageUp(PathBuf),
     MovePageDown(PathBuf),
+    /// A row dragged in the navigation pane and let go: where it goes.
+    Place(PathBuf, crate::navdrag::Drop),
     PageVersions(PathBuf),
     Delete(PathBuf, String, usize),
     Color(PathBuf, Option<NodeColor>),
@@ -1111,6 +1113,8 @@ pub struct NoteCraftApp {
     /// History > Hide Authors: who changed a page is not shown under its title. What the page
     /// keeps is not touched (issue #292).
     hide_authors: bool,
+    /// Printouts being made off the window's thread, with the format of the page each is for.
+    printouts: Vec<(crate::printout::Job, PageFormat)>,
     open: HashSet<PathBuf>,
     selected: Option<PathBuf>,
     /// The pages visited, for Back and Forward.
@@ -1383,6 +1387,7 @@ impl NoteCraftApp {
             saver,
             author_name,
             hide_authors,
+            printouts: Vec::new(),
             nav: NavHistory::default(),
             qat,
             last_ink_change: None,
@@ -2250,6 +2255,11 @@ impl NoteCraftApp {
     /// Opens every level of the tree.
     pub fn expand_all(&mut self) {
         self.open = self.collect_branches().into_iter().collect();
+    }
+
+    /// How many printouts are still being made.
+    pub fn printouts_pending(&self) -> usize {
+        self.printouts.len()
     }
 
     /// Whether the page being edited has unsaved changes.
@@ -3312,50 +3322,94 @@ impl NoteCraftApp {
         }
     }
 
+    /// Starts making a printout of `file` for the page in `dir`, off the window's thread: the
+    /// page goes on being written in while it is made ([`crate::printout::Job`]), and it goes in
+    /// once it is ready ([`Self::poll_printouts`]).
     fn insert_printout(&mut self, dir: &Path, file: &Path, format: PageFormat) {
-        let rendered = match printout::render(file) {
-            Ok(rendered) => rendered,
+        let job = crate::printout::Job::start(dir, file);
+        self.say(crate::i18n::format_message_id("ui.making_a_printout_of_name", &[("name", &job.name)]));
+        self.printouts.push((job, format));
+    }
+
+    /// Takes in the printouts that are ready, and says how far along the others are.
+    fn poll_printouts(&mut self, ctx: &Context) {
+        let mut i = 0;
+        while i < self.printouts.len() {
+            match self.printouts[i].0.poll() {
+                None => {
+                    let (done, total) = self.printouts[i].0.pages;
+                    if total > 0 {
+                        let name = self.printouts[i].0.name.clone();
+                        self.say(crate::i18n::format_message_id(
+                            "ui.making_a_printout_of_name_page_done_of_total",
+                            &[("name", &name), ("done", &done.to_string()), ("total", &total.to_string())],
+                        ));
+                    }
+                    i += 1;
+                }
+                Some(made) => {
+                    let (job, format) = self.printouts.remove(i);
+                    self.finish_printout(&job, format, made);
+                }
+            }
+        }
+        if !self.printouts.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    /// Puts a printout that is ready into its page: the open one where the writer is, as
+    /// [`Self::insert_printout_blocks`] does, or, when another page was opened meanwhile, into
+    /// that page's file, in a box of its own below what is there.
+    fn finish_printout(&mut self, job: &crate::printout::Job, format: PageFormat, made: Result<crate::printout::Made, String>) {
+        let made = match made {
+            Ok(made) => made,
             Err(error) => {
                 self.complain(&error);
                 return;
             }
         };
-        let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let Some(Output::Text(link)) = self.run("page.attach", &params(&[("path", &path_str(dir)), ("source", &path_str(file))])) else {
-            self.complain(&crate::i18n::format_message_id("ui.could_not_attach_name_before_rendering_its_pages", &[("name", &name)]));
-            return;
-        };
-        let Some(base) = link.strip_prefix("assets/").and_then(|link| Path::new(link).file_name()).map(|name| name.to_string_lossy().into_owned())
-        else {
-            self.complain(crate::tl_id!("ui.the_attachment_returned_an_invalid_page_link"));
-            return;
-        };
-        let assets = dir.join("assets");
-        let mut generated = Vec::with_capacity(rendered.pages().len());
-        for (index, page) in rendered.pages().iter().enumerate() {
-            let target = assets.join(format!("{base}.printout-{:03}.png", index + 1));
-            if let Err(error) = std::fs::copy(page, &target) {
-                for path in &generated {
-                    let _ = std::fs::remove_file(path);
-                }
-                self.complain(&crate::i18n::format_message_id(
-                    "ui.could_not_store_printout_page_page_error",
-                    &[("page", &(index + 1).to_string()), ("error", &error.to_string())],
-                ));
-                return;
+        let mut text = snippets::attachment(format, &made.link, &job.name);
+        for (index, image) in made.images.iter().enumerate() {
+            text.push_str(&snippets::printout_page(format, image, index + 1));
+        }
+        if self.editor.as_ref().is_some_and(|ed| ed.dir == job.dir) {
+            self.insert_printout_blocks(&text);
+            if let Some(ed) = self.editor.as_mut() {
+                ed.attachments = notecraft_store::assets::list(&ed.dir);
             }
-            generated.push(target);
+        } else if !self.add_to_page_file(&job.dir, &text) {
+            return;
         }
-        let mut text = snippets::attachment(format, &link, &name);
-        for (index, _) in generated.iter().enumerate() {
-            let image = format!("assets/{base}.printout-{:03}.png", index + 1);
-            text.push_str(&snippets::printout_page(format, &image, index + 1));
-        }
-        self.insert_printout_blocks(&text);
         self.say(crate::i18n::format_message_id(
             "ui.inserted_name_and_count_printout_pages",
-            &[("name", &name), ("count", &generated.len().to_string())],
+            &[("name", &job.name), ("count", &made.images.len().to_string())],
         ));
+    }
+
+    /// Adds `text` to the page in `dir`, which is not the one open, in a box of its own below its
+    /// boxes, and writes it. Says why when it cannot, and returns whether it did.
+    fn add_to_page_file(&mut self, dir: &Path, text: &str) -> bool {
+        let page = match notecraft_store::page::load_page(dir) {
+            Ok(page) => page,
+            Err(e) => {
+                self.complain(&e.to_string());
+                return false;
+            }
+        };
+        let (mut blocks, arranged) = notecraft_formats::boxes::read(page.format, &page.body);
+        let (added, _) = notecraft_formats::boxes::read(page.format, text);
+        let body = match arranged {
+            Some(boxes) if !boxes.is_empty() => {
+                let width = boxes.first().map_or(360.0, |c| c.width);
+                let below = boxes.iter().map(|c| c.y + 60.0).fold(0.0, f32::max);
+                let boxes = notecraft_model::container::append(&boxes, blocks.len(), added.len(), width, below, 12.0);
+                blocks.extend(added);
+                notecraft_formats::boxes::write(page.format, &blocks, Some(&boxes))
+            }
+            _ => format!("{}\n{text}", page.body.trim_end()),
+        };
+        self.run("page.save", &params(&[("path", &path_str(dir)), ("body", &body)])).is_some()
     }
 
     // ---------- tree ----------
@@ -3471,6 +3525,7 @@ impl NoteCraftApp {
                     self.session.refresh();
                 }
             }
+            Act::Place(path, drop) => self.place_dropped(&path, &drop),
             Act::PageVersions(path) => self.show_page_versions(&path),
             Act::Delete(path, title, count) => self.dialog = Some(Dialog::Delete { path, title, count }),
             Act::Color(path, color) => {
@@ -3496,6 +3551,135 @@ impl NoteCraftApp {
         }
     }
 
+    /// Dragging rows in the navigation pane: taking hold of `node`'s row, showing where a carried
+    /// row would go over this one, and letting go (see `navdrag`).
+    fn drag_row(&self, ui: &Ui, node: &Node, rect: egui::Rect, resp: &egui::Response, acts: &mut Vec<Act>) {
+        use crate::navdrag::{Carried, Drop, carried_id, drop_at, drop_id};
+        let ctx = ui.ctx();
+        let frame = ctx.cumulative_frame_nr();
+        if resp.drag_started() {
+            ctx.data_mut(|d| {
+                d.insert_temp(carried_id(), Carried { path: node.path.clone(), kind: node.info.kind, title: node.info.title.clone() });
+                d.remove::<(u64, Option<Drop>)>(drop_id());
+            });
+        }
+        let Some(carried) = ctx.data(|d| d.get_temp::<Carried>(carried_id())) else { return };
+        // Escape puts it back: nothing is moved when the button comes up.
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ctx.data_mut(|d| {
+                d.remove::<Carried>(carried_id());
+                d.remove::<(u64, Option<Drop>)>(drop_id());
+            });
+            return;
+        }
+        let t = &self.tokens;
+        // Over this row: where it would go, shown on the row.
+        if let Some(p) = ctx.pointer_latest_pos().filter(|p| rect.contains(*p))
+            && carried.path != node.path
+        {
+            let drop = drop_at(&carried, &node.path, node.info.kind, rect.min.y, rect.max.y, p.y);
+            let painter = ui.painter_at(rect.expand(2.0));
+            match &drop {
+                Some(Drop::Before(_)) => {
+                    painter.line_segment([rect.left_top() + vec2(4.0, 0.0), rect.right_top() - vec2(4.0, 0.0)], egui::Stroke::new(2.0, t.accent));
+                }
+                Some(Drop::After(_)) => {
+                    painter
+                        .line_segment([rect.left_bottom() + vec2(4.0, 0.0), rect.right_bottom() - vec2(4.0, 0.0)], egui::Stroke::new(2.0, t.accent));
+                }
+                Some(Drop::Into(_)) => {
+                    painter.rect_stroke(rect.shrink(1.0), 4.0, egui::Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
+                }
+                None => {}
+            }
+            ctx.data_mut(|d| d.insert_temp(drop_id(), (frame, drop)));
+        }
+        if resp.dragged() && carried.path == node.path {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            // What is carried follows the pointer, faintly, above everything else.
+            if let Some(p) = ctx.pointer_latest_pos() {
+                let layer = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("nav-drag-ghost")));
+                let galley = ui.painter().layout_no_wrap(carried.title.clone(), egui::FontId::proportional(13.0), t.text);
+                let at = p + vec2(14.0, -galley.size().y / 2.0);
+                let back = egui::Rect::from_min_size(at - vec2(6.0, 3.0), galley.size() + vec2(12.0, 6.0));
+                layer.rect_filled(back, 4.0, t.panel.gamma_multiply(0.92));
+                layer.rect_stroke(back, 4.0, egui::Stroke::new(1.0, t.container_border), egui::StrokeKind::Inside);
+                layer.galley(at, galley, t.text);
+            }
+        }
+        if resp.drag_stopped() && carried.path == node.path {
+            // Only where the pointer is now, or was a frame ago: a row it has left has no say.
+            let drop = ctx.data_mut(|d| {
+                d.remove::<Carried>(carried_id());
+                d.remove_temp::<(u64, Option<Drop>)>(drop_id())
+            });
+            if let Some((when, Some(drop))) = drop
+                && when + 1 >= frame
+                && ctx.pointer_latest_pos().is_some_and(|p| ctx.viewport_rect().contains(p))
+            {
+                acts.push(Act::Place(node.path.clone(), drop));
+            }
+        }
+    }
+
+    /// Puts a row dragged in the navigation pane where it was let go: above or below another row,
+    /// among the rows beside it, or into one. The window stays on the page it was on, wherever
+    /// that page went.
+    fn place_dropped(&mut self, path: &Path, drop: &crate::navdrag::Drop) {
+        use crate::navdrag::Drop;
+        self.save_now();
+        if self.is_dirty() {
+            return;
+        }
+        let kind = notecraft_store::tree::read_node(path).map(|n| n.kind);
+        let target = crate::navdrag::target(drop).to_path_buf();
+        // The nodes beside the target, in their order: the notebooks, or what its parent holds.
+        let beside: Vec<PathBuf> = {
+            fn holding<'a>(nodes: &'a [Node], child: &Path) -> Option<&'a [Node]> {
+                if nodes.iter().any(|n| n.path == child) {
+                    return Some(nodes);
+                }
+                nodes.iter().find(|n| child.starts_with(&n.path)).and_then(|n| holding(&n.children, child))
+            }
+            holding(self.session.tree(), &target).map(|nodes| nodes.iter().map(|n| n.path.clone()).collect()).unwrap_or_default()
+        };
+        let (to, before) = match drop {
+            Drop::Into(into) => (into.clone(), None),
+            Drop::Before(row) => (row.parent().map(Path::to_path_buf).unwrap_or_default(), Some(row.clone())),
+            Drop::After(row) => {
+                // Before whatever follows the row, not counting what is carried: below the row
+                // just above where it already is, it stays where it is.
+                let next = beside.iter().position(|p| p == row).and_then(|i| beside.iter().skip(i + 1).find(|p| *p != path)).cloned();
+                (row.parent().map(Path::to_path_buf).unwrap_or_default(), next)
+            }
+        };
+        let mut p = vec![("path", path_str(path))];
+        if kind != Some(NodeKind::Notebook) {
+            p.push(("to", path_str(&to)));
+        }
+        if let Some(before) = &before {
+            p.push(("before", path_str(before)));
+        }
+        let pairs: Vec<(&str, &str)> = p.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let editor_path = self.editor.as_ref().map(|editor| editor.dir.clone());
+        let Some(Output::Path(new_path)) = self.run("node.place", &params(&pairs)) else { return };
+        self.session.refresh();
+        if matches!(drop, Drop::Into(_)) {
+            self.open.insert(to);
+        }
+        if new_path != path {
+            self.nav.relocate(path, &new_path);
+            let remap = |candidate: &Path| candidate.strip_prefix(path).map_or_else(|_| candidate.to_path_buf(), |suffix| new_path.join(suffix));
+            self.open = self.open.iter().map(|branch| remap(branch)).collect();
+            self.selected = self.selected.as_deref().map(remap);
+            if let Some(editor_path) = editor_path.filter(|editor_path| editor_path.starts_with(path)) {
+                let relocated = remap(&editor_path);
+                self.open_page_inner(&relocated);
+            }
+        }
+        self.say(crate::tl_id!("ui.moved"));
+    }
+
     fn draw_node(&self, ui: &mut Ui, node: &Node, depth: usize, acts: &mut Vec<Act>) {
         self.draw_row(ui, node, depth, acts, true);
     }
@@ -3507,9 +3691,12 @@ impl NoteCraftApp {
         let open = self.open.contains(&node.path);
         let selected = self.selected.as_deref() == Some(node.path.as_path());
         let width = ui.available_width();
-        let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_HEIGHT), Sense::click());
+        // A row can be taken hold of and dragged elsewhere in the pane (see `navdrag`); a press
+        // that hardly moves is still a click.
+        let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_HEIGHT), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         let t = &self.tokens;
+        self.drag_row(ui, node, rect, &resp, acts);
         if selected {
             painter.rect_filled(rect, 4.0, t.row_selected);
         } else if resp.hovered() {
@@ -6050,14 +6237,14 @@ impl NoteCraftApp {
     /// Letters going into the block the caret was already in fold into the step before
     /// them, so Ctrl+Z takes back a run of writing rather than one character.
     fn remember_step(ed: &mut Editor) {
-        Self::remember(ed, false);
+        Self::remember(ed, false, None);
     }
 
     /// Remembers a change made from the ribbon rather than by writing, such as Insert Space
     /// or a row put into a table, as a step of its own. It never folds into the writing
     /// before it, even when the caret stays in the same block (issue #153).
     fn remember_edit(ed: &mut Editor) {
-        Self::remember(ed, true);
+        Self::remember(ed, true, None);
     }
 
     /// Remembers a change to how a table is laid out that may leave its words as they were,
@@ -6073,7 +6260,9 @@ impl NoteCraftApp {
         ed.history.record(step);
     }
 
-    fn remember(ed: &mut Editor, edit: bool) {
+    /// `moving`: boxes moved by the press of the pointer that went down then, and nothing else
+    /// changed. The frames of one drag fold into one step.
+    fn remember(ed: &mut Editor, edit: bool, moving: Option<u64>) {
         let same = ed.history.here().is_some_and(|s| s.body == ed.body && s.blocks == ed.blocks && s.boxes == ed.boxes);
         if same || {
             // Only the cursor's place on open paper came or went: the page is the one remembered.
@@ -6091,8 +6280,9 @@ impl NoteCraftApp {
         let here = ed.caret.as_ref().map(|c| c.block);
         let was = ed.history.here().and_then(|s| s.caret.as_ref().map(|c| c.block));
         let shape = ed.history.here().is_some_and(|s| s.blocks.len() == ed.blocks.len());
-        let kind = match (shape, here, was) {
-            (true, Some(a), Some(b)) if a == b && !edit => crate::history::Kind::Typing(a),
+        let kind = match (moving, shape, here, was) {
+            (Some(press), ..) => crate::history::Kind::Moving(press),
+            (None, true, Some(a), Some(b)) if a == b && !edit => crate::history::Kind::Typing(a),
             _ => crate::history::Kind::Edit,
         };
         let mut step = crate::history::Step::new(ed.body.clone(), ed.blocks.clone(), ed.boxes.clone(), ed.caret.clone(), kind);
@@ -6684,6 +6874,9 @@ impl NoteCraftApp {
                 caret.inline = None;
                 caret.selection = (0, caret.text.chars().count());
             }
+            // The source text changed when the marks were added or removed. Restore egui's
+            // range too, or typing replaces only the old offsets and leaves markup behind.
+            ed.restore_format_selection = Some((caret.block, caret.selection.0, caret.selection.1));
             ed.rebuild_body();
             Self::mark_dirty_from_blocks(ed);
             return;
@@ -7523,31 +7716,64 @@ impl NoteCraftApp {
 
     /// Makes the block the caret is in a heading, a list item, a quote or ordinary text.
     fn apply_block_kind(&mut self, kind: &str) {
-        let Some(ed) = self.editor.as_mut() else { return };
+        let Some(ed) = self.editor.as_mut() else {
+            log::info!("ui_action: action=block_kind.apply kind={kind} outcome=no_page");
+            return;
+        };
         let Some(caret) = ed.caret.as_ref() else {
             self.status = crate::tl_id!("ui.click_in_the_page_first_then_use_the_ribbon").into();
             self.status_is_error = false;
+            log::info!("ui_action: action=block_kind.apply kind={kind} outcome=no_caret");
             return;
         };
         let at = caret.block;
-        // A style on a line of a code block applies to that line only: the block splits around it.
-        let line = caret.text.get(..caret.selection.1.min(caret.text.len())).map_or(0, |t| t.matches('\n').count());
+        let selection = caret.selection;
+        let selection_shape = if selection.0 == selection.1 { "caret" } else { "range" };
+        let low = selection.0.min(selection.1);
+        let high = selection.0.max(selection.1);
+        let line_at = |offset: usize| caret.text.chars().take(offset).filter(|ch| *ch == '\n').count();
+        let caret_line = line_at(selection.0);
+        let first_line = line_at(low);
+        let last_line = if low == high { first_line } else { line_at(high.saturating_sub(1)) };
+        let selected_line_count = last_line.saturating_sub(first_line) + 1;
         let in_code = matches!(ed.blocks.get(at), Some(notecraft_formats::markdown::Block::Code { .. }));
-        if in_code && !matches!(kind, "codeblock" | "codenumbers") {
-            if !pageedit::split_code_line(&mut ed.blocks, at, line, kind) {
+        let code = in_code && !matches!(kind, "codeblock" | "codenumbers");
+        log::info!(
+            "ui_action: action=block_kind.apply kind={kind} target={} selection={selection_shape} chars={low}..{high} caret_line={caret_line} lines={first_line}..={last_line} selected_lines={selected_line_count} outcome=attempted",
+            if in_code { "code" } else { "other" }
+        );
+        if code {
+            if !pageedit::split_code_selection(&mut ed.blocks, at, selection, kind) {
+                log::info!(
+                    "ui_action: action=block_kind.apply kind={kind} target=code selection={selection_shape} chars={low}..{high} caret_line={caret_line} lines={first_line}..={last_line} selected_lines={selected_line_count} outcome=refused"
+                );
                 return;
             }
         } else if !pageedit::set_kind(&mut ed.blocks, at, kind) {
+            log::info!(
+                "ui_action: action=block_kind.apply kind={kind} target=other selection={selection_shape} chars={low}..{high} caret_line={caret_line} outcome=refused"
+            );
             return;
         }
         ed.rebuild_body();
-        if let Some(b) = ed.blocks.get(at) {
+        let caret_block = at + usize::from(code && first_line > 0);
+        if let Some(b) = ed.blocks.get(caret_block) {
             let text = pageedit::caret_text(b);
             if let Some(c) = ed.caret.as_mut() {
+                c.block = caret_block;
                 c.text = text;
+                c.selection = (0, 0);
+                c.place = Some(0);
             }
         }
+        if code {
+            ed.restore_format_selection = Some((caret_block, 0, 0));
+        }
         Self::mark_dirty_from_blocks(ed);
+        log::info!(
+            "ui_action: action=block_kind.apply kind={kind} target={} selection={selection_shape} chars={low}..{high} caret_line={caret_line} lines={first_line}..={last_line} selected_lines={selected_line_count} result_block={caret_block} outcome=applied",
+            if in_code { "code" } else { "other" }
+        );
     }
 
     /// Puts a tag on the line the caret is in, or takes it off again.
@@ -9365,15 +9591,19 @@ impl NoteCraftApp {
             if (changed || from_blocks) && Self::name_ink(ed) {
                 from_blocks = true;
             }
-            if changed || from_blocks || boxes_moved {
-                Self::remember_step(ed);
-            }
             // A container was dragged or resized: the arrangement is the page's own, so it
-            // is written into the page's file rather than kept in the window.
+            // is written into the page's file rather than kept in the window. Done before the
+            // step is taken, so the step's text holds the boxes where they now are.
             if boxes_moved {
                 ed.arranged = true;
                 ed.rebuild_body();
                 Self::mark_dirty_from_blocks(ed);
+            }
+            if changed || from_blocks || boxes_moved {
+                // Boxes moved while the pointer is held: one drag, one step.
+                let press = ui.input(|i| (i.pointer.any_down() || i.pointer.any_released()).then(|| i.pointer.press_start_time()).flatten());
+                let moving = (boxes_moved && !changed && !from_blocks).then_some(press).flatten().map(f64::to_bits);
+                Self::remember(ed, false, moving);
             }
             // A column was dragged wider or narrower. Widths are layout, like the boxes,
             // so they go into the page's own file beside them.
@@ -11901,6 +12131,7 @@ impl NoteCraftApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
+        self.poll_printouts(ctx);
         self.take_saves(false);
         if self.saver.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -12633,7 +12864,7 @@ mod alert_tests {
             |h: &egui_kittest::Harness<'_, NoteCraftApp>| h.state().editor.as_ref().map(|e| (e.blocks.clone(), e.boxes.clone())).expect("editor");
         let before = shape(&h);
         let dir = page.clone();
-        h.state_mut().add_file(&dir, &pdf, FileChoice::Printout);
+        add_printout(&mut h, &dir, &pdf);
         // Long enough for the autosave to write the page and the window to settle.
         for _ in 0..60 {
             h.step();
@@ -12675,6 +12906,79 @@ mod alert_tests {
             h.step();
         }
         (t, page, pdf, h)
+    }
+
+    /// Asks for a printout of `pdf` in `page` and waits for it: it is made in the background.
+    fn add_printout(h: &mut egui_kittest::Harness<'_, NoteCraftApp>, page: &Path, pdf: &Path) {
+        h.state_mut().add_file(page, pdf, FileChoice::Printout);
+        for _ in 0..500 {
+            h.step();
+            if h.state().printouts_pending() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(h.state().printouts_pending(), 0, "the printout was made");
+        for _ in 0..3 {
+            h.step();
+        }
+    }
+
+    /// A printout is made off the window's thread: asking for one returns at once, the window
+    /// carries on drawing, and the pages go in once they are ready. Making one froze the page
+    /// for seconds (rendering, then copying every page into the page's folder).
+    #[test]
+    fn a_printout_is_made_in_the_background_and_goes_in_when_ready() {
+        let (_t, page, pdf, mut h) = printout_harness(true, "printout-background");
+        let before = h.state().editor.as_ref().map(|e| e.blocks.len()).expect("editor");
+        h.state_mut().add_file(&page, &pdf, FileChoice::Printout);
+        assert_eq!(h.state().printouts_pending(), 1, "the printout is being made");
+        assert_eq!(h.state().editor.as_ref().map(|e| e.blocks.len()), Some(before), "and the page is not waiting for it");
+        h.step();
+        for _ in 0..500 {
+            h.step();
+            if h.state().printouts_pending() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ed = h.state().editor.as_ref().expect("editor");
+        assert!(ed.blocks.len() > before, "the printout went in once it was ready");
+        assert!(
+            ed.blocks.iter().any(|b| matches!(b, notecraft_formats::Block::Image { src, .. } if src.contains(".printout-001.png"))),
+            "its page is a picture in the page"
+        );
+    }
+
+    /// A printout asked for on one page goes into that page, even when another page was opened
+    /// while it was being made.
+    #[test]
+    fn a_printout_goes_into_its_own_page_when_another_was_opened_meanwhile() {
+        let (_t, page, pdf, mut h) = printout_harness(true, "printout-other-page");
+        let other = {
+            let parent = page.parent().expect("section").to_path_buf();
+            std::fs::read_dir(&parent)
+                .expect("section")
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .find(|p| p.is_dir() && *p != page)
+                .expect("another page")
+        };
+        h.state_mut().add_file(&page, &pdf, FileChoice::Printout);
+        h.state_mut().open_path(&other.to_string_lossy());
+        for _ in 0..500 {
+            h.step();
+            if h.state().printouts_pending() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(h.state().editor.as_ref().map(|e| e.dir.clone()), Some(other.clone()), "the other page is the one open");
+        let file = notecraft_store::tree::page_file(&page).expect("the first page's file").1;
+        let text = std::fs::read_to_string(file).expect("read");
+        assert!(text.contains(".printout-001.png"), "the printout is in the page it was asked for:\n{text}");
+        let other_file = notecraft_store::tree::page_file(&other).expect("the other page's file").1;
+        assert!(!std::fs::read_to_string(other_file).expect("read").contains(".printout-001.png"), "and not in the other one");
     }
 
     /// The window opens where it was left: the same page, even in a notebook kept outside the
@@ -12780,7 +13084,7 @@ mod alert_tests {
     #[test]
     fn drawing_a_page_of_printouts_does_not_ask_the_disk_every_frame() {
         let (_t, page, pdf, mut h) = printout_harness(true, "printout-quiet-frames");
-        h.state_mut().add_file(&page, &pdf, FileChoice::Printout);
+        add_printout(&mut h, &page, &pdf);
         for _ in 0..5 {
             h.step();
         }
@@ -12801,10 +13105,7 @@ mod alert_tests {
             let (_t, page, pdf, mut h) = printout_harness(html, "printout-below");
             h.state_mut().editor.as_mut().expect("editor").caret = None;
             for _ in 0..2 {
-                h.state_mut().add_file(&page, &pdf, FileChoice::Printout);
-                for _ in 0..5 {
-                    h.step();
-                }
+                add_printout(&mut h, &page, &pdf);
             }
             let all = h.state().editor.as_ref().map(|e| e.boxes.clone()).expect("editor");
             // The sample page's words, then one box for each printout, each one further down.
@@ -12851,10 +13152,7 @@ mod alert_tests {
             }
             let boxes_with_blank = h.state().editor.as_ref().map(|e| e.boxes.len()).expect("editor");
             h.state_mut().editor.as_mut().expect("editor").caret = None;
-            h.state_mut().add_file(&page, &pdf, FileChoice::Printout);
-            for _ in 0..5 {
-                h.step();
-            }
+            add_printout(&mut h, &page, &pdf);
             let ed = h.state().editor.as_ref().expect("editor");
             assert!(!ed.boxes.iter().any(|c| c.y == 2000.0), "html={html}: the blank box went: {:?}", ed.boxes);
             assert_eq!(ed.boxes.len(), boxes_with_blank, "html={html}: one box for the printout, none for the blank line: {:?}", ed.boxes);
@@ -12935,10 +13233,7 @@ mod alert_tests {
             }
             let before = h.state().editor.as_ref().map(|e| e.boxes.clone()).expect("editor");
             let blocks_before = h.state().editor.as_ref().map(|e| e.blocks.clone()).expect("editor");
-            h.state_mut().add_file(&page, &pdf, FileChoice::Printout);
-            for _ in 0..5 {
-                h.step();
-            }
+            add_printout(&mut h, &page, &pdf);
             let ed = h.state().editor.as_ref().expect("editor");
             assert_eq!(ed.boxes.len(), before.len(), "html={html}: no new box was made: {:?}", ed.boxes);
             let moved = &ed.boxes[index];

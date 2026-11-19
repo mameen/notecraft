@@ -7980,6 +7980,76 @@ fn a_picture_in_a_shared_box_is_moved_by_dragging_it() {
     }
 }
 
+/// A printout is one thing on the page, as in OneNote. Taking hold of any of its pages moves the
+/// whole printout, its card and every page: in a box of its own the box moves, and in a box shared
+/// with words the printout is lifted out together rather than page by page. One Ctrl+Z puts a
+/// drag back however many frames it took.
+#[test]
+fn a_printout_moves_as_one_and_undo_puts_it_back() {
+    for shared in [false, true] {
+        let what = format!("shared={shared}");
+        let t = TempDir::new("ui-printout-moves-whole");
+        let mut s = session(&t);
+        let sample = create_sample(&mut s, Some(LOGO_PNG)).expect("sample");
+        let path = sample.md_page.to_string_lossy().into_owned();
+        s.attach_bytes(&path, "a.pdf", b"%PDF-1.4\n").expect("pdf");
+        s.attach_bytes(&path, "a.pdf.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"/>").expect("card");
+        s.attach_bytes(&path, "a.pdf.printout-001.png", LOGO_PNG).expect("page 1");
+        s.attach_bytes(&path, "a.pdf.printout-002.png", LOGO_PNG).expect("page 2");
+        // Small pages, so both are in the window.
+        let printout = "[![a.pdf](assets/a.pdf.svg)](assets/a.pdf)\n\n<img src=\"assets/a.pdf.printout-001.png\" alt=\"Printout page 1\" width=\"200\" height=\"100\">\n\n<img src=\"assets/a.pdf.printout-002.png\" alt=\"Printout page 2\" width=\"200\" height=\"100\">\n";
+        let body = if shared { format!("Before\n\n{printout}\nAfter\n") } else { printout.to_string() };
+        let blocks = if shared { 5 } else { 3 };
+        s.run("page.save", &params(&[("path", &path), ("body", &body)])).expect("page");
+        s.run("page.containers", &params(&[("path", &path), ("boxes", &format!("0,0,500,{blocks}"))])).expect("one box");
+        let mut app = NoteCraftApp::new(s);
+        app.open_path(&path);
+        let mut h = harness(app, LIGHT);
+        settle(&mut h);
+        let boxes = |h: &mut Harness<'_, NoteCraftApp>| {
+            let state = look_at(h);
+            state
+                .pointer("/page/containers")
+                .and_then(Value::as_array)
+                .map(|b| {
+                    b.iter()
+                        .map(|c| {
+                            let f = |k: &str| c.get(k).and_then(Value::as_f64).unwrap_or(-1.0) as f32;
+                            (f("x"), f("y"), c.get("blocks").and_then(Value::as_u64).unwrap_or(0))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let before = boxes(&mut h);
+        assert_eq!(before, vec![(0.0, 0.0, blocks as u64)], "one box to begin with in {what}");
+
+        // Take hold of the second page and drag it, over many frames.
+        let page_two = if shared { 3 } else { 2 };
+        let start = rendered_picture_rect(&h, page_two).center();
+        ask(&mut h, "ui.press", json!({"x": start.x, "y": start.y})).expect("press the page");
+        for step in 1..=20 {
+            let f = step as f32;
+            ask(&mut h, "ui.move", json!({"x": start.x + 4.0 * f, "y": start.y + 3.0 * f})).expect("drag");
+        }
+        ask(&mut h, "ui.release", json!({"x": start.x + 80.0, "y": start.y + 60.0})).expect("drop");
+        settle(&mut h);
+        let after = boxes(&mut h);
+        if shared {
+            let counts: Vec<u64> = after.iter().map(|b| b.2).collect();
+            assert_eq!(counts, vec![1, 3, 1], "the words, the whole printout, the words in {what}: {after:?}");
+        } else {
+            assert_eq!(after.len(), 1, "still one box in {what}: {after:?}");
+            assert!((after[0].0 - 80.0).abs() < 2.0 && (after[0].1 - 60.0).abs() < 2.0, "the box went with the pointer in {what}: {after:?}");
+        }
+
+        // One Ctrl+Z, and the page is as it was.
+        ask(&mut h, "ui.key", json!({"key": "Z", "ctrl": true})).expect("Ctrl+Z");
+        settle(&mut h);
+        assert_eq!(boxes(&mut h), before, "one undo puts the whole drag back in {what}");
+    }
+}
+
 // The native attachment-card double-click path is manually verified on Windows. The Linux
 // headless WGPU runner does not deliver the rendered attachment hit target consistently: the
 // same test stalls for the full suite timeout there while passing locally.
@@ -8926,9 +8996,12 @@ fn font_family_applies_to_a_selection_across_paragraphs() {
     settle(&mut h);
     ask(&mut h, "ui.release", json!({"x": second.center().x, "y": second.center().y})).expect("release");
     settle(&mut h);
-    h.get_by_label("Font Family").click();
+    h.get_by_label("Font name").click();
     h.run();
-    h.get_by_label(family).click();
+    ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select the box text");
+    ask(&mut h, "ui.text", json!({"text": family.to_string()})).expect("type the font name");
+    settle(&mut h);
+    h.get_by_label(family.as_str()).click();
     settle(&mut h);
     let body = h.state().body().unwrap_or_default().to_string();
     assert_eq!(body.matches("font-family:").count(), 2, "both paragraphs took the family:\n{body}");
@@ -9228,7 +9301,8 @@ fn font_selectors_show_selection_values_and_mixed_state_in_both_formats() {
         assert_eq!(h.get_by_label("Font Family").value().as_deref(), Some("Mixed"));
         assert_eq!(h.get_by_label("Font Size").value().as_deref(), Some("Mixed"));
         h.get_by_label("Font Size").click();
-        h.run();
+        // Background font loading can still ask for a frame here, so wait for the frames to settle.
+        settle(&mut h);
         h.get_by_label("24").click();
         settle(&mut h);
         assert_eq!(h.get_by_label("Font Size").value().as_deref(), Some("24"));
@@ -9383,11 +9457,37 @@ fn choosing_a_font_changes_the_font_box() {
     settle(&mut h);
     ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
     settle(&mut h);
-    h.get_by_label("Font Family").click();
+    h.get_by_label("Font name").click();
     h.run();
+    ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select the box text");
+    ask(&mut h, "ui.text", json!({"text": name.to_string()})).expect("type the font name");
+    settle(&mut h);
     h.get_by_label(&name).click();
     settle(&mut h);
     assert_eq!(h.get_by_label("Font Family").value().as_deref(), Some(name.as_str()), "the box shows the chosen font");
+}
+
+/// Typing in the font box lists the families that contain the text, so a family can be found by
+/// its middle letters rather than scrolled to.
+#[test]
+fn typing_a_font_name_lists_the_families_that_contain_it() {
+    let Ok(catalog) = notecraft_ui_egui::fonts::system_catalog() else { return };
+    let Some(name) = catalog.families().iter().find(|n| notecraft_formats::markdown::valid_font_family(n) && n.len() > 4).cloned() else { return };
+    let query: String = name.chars().skip(1).take(3).collect();
+    let (_t, app, s) = sample_app("ui-font-filter");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(2000.0, 900.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+    settle(&mut h);
+    // "Font name" is the text box; "Font Family" is the arrow beside it, which opens the list.
+    h.get_by_label("Font name").click();
+    h.run();
+    ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select the box's text");
+    ask(&mut h, "ui.text", json!({"text": query})).expect("type a part of the name");
+    settle(&mut h);
+    h.get_by_label(&name);
+    assert_eq!(h.get_by_label("Font name").value().as_deref(), Some(query.as_str()), "the box shows what was typed");
 }
 
 /// Dragging across plain text selects it, and the page reports the selection.
@@ -9430,8 +9530,11 @@ fn choosing_a_font_without_a_caret_changes_the_font_box() {
     let mut h = sized_harness(app, LIGHT, egui::vec2(2000.0, 900.0));
     h.state_mut().open_path(&s.md_page.to_string_lossy());
     settle(&mut h);
-    h.get_by_label("Font Family").click();
+    h.get_by_label("Font name").click();
     h.run();
+    ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select the box text");
+    ask(&mut h, "ui.text", json!({"text": name.to_string()})).expect("type the font name");
+    settle(&mut h);
     h.get_by_label(&name).click();
     settle(&mut h);
     assert_eq!(h.get_by_label("Font Family").value().as_deref(), Some(name.as_str()), "the box shows the chosen font");
@@ -9493,8 +9596,11 @@ fn installed_font_family_can_be_applied_and_undone_in_both_formats() {
         pump(&mut h);
         ask(&mut h, "ui.key", json!({"key": "A", "ctrl": true})).expect("select text");
         pump(&mut h);
-        h.get_by_label("Font Family").click();
+        h.get_by_label("Font name").click();
         h.run();
+        ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select the box text");
+        ask(&mut h, "ui.text", json!({"text": family.to_string()})).expect("type the font name");
+        settle(&mut h);
         h.get_by_label(&family).click();
         settle(&mut h);
         let after = h.state().body().unwrap_or_default().to_string();
@@ -9536,8 +9642,11 @@ fn installed_family_and_underline_apply_to_new_text() {
     ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
     pump(&mut h);
     let before = h.state().body().unwrap_or_default().to_string();
-    h.get_by_label("Font Family").click();
+    h.get_by_label("Font name").click();
     h.run();
+    ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select the box text");
+    ask(&mut h, "ui.text", json!({"text": family.to_string()})).expect("type the font name");
+    settle(&mut h);
     h.get_by_label(&family).click();
     settle(&mut h);
     assert_eq!(h.get_by_label("Font Family").value().as_deref(), Some(family.as_str()), "pending family is shown before typing");
@@ -10119,6 +10228,38 @@ mod formatting_shortcuts_match_ribbon_and_keep_selection_history_and_storage {
     case!(dark_html_underline_command, DARK, Html, U, "Underline", true);
 }
 
+/// Issue #242: applying formatting to a full selection must leave the visible selection
+/// intact, so immediately typing replaces the words rather than stale source offsets.
+#[test]
+fn replacing_a_formatted_full_selection_keeps_only_the_replacement_in_both_formats() {
+    for (format, body) in
+        [(notecraft_model::PageFormat::Html, "<p>Alpha beta gamma delta.</p>"), (notecraft_model::PageFormat::Cmgfm, "Alpha beta gamma delta.")]
+    {
+        let (_t, app, s) = sample_app("ui-format-selection-replacement");
+        let mut h = sized_harness(app, LIGHT, egui::vec2(2000.0, 900.0));
+        let page = if format == notecraft_model::PageFormat::Html { &s.html_page } else { &s.md_page };
+        notecraft_store::page::save_body(page, body).expect("fixture");
+        h.state_mut().open_path(&page.to_string_lossy());
+        settle(&mut h);
+        ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+        pump(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "Home"})).expect("home");
+        pump(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select all");
+        pump(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "b", "ctrl": true})).expect("bold selection");
+        settle(&mut h);
+        ask(&mut h, "ui.text", json!({"text": "Replacement"})).expect("replace selection");
+        settle(&mut h);
+
+        let saved = h.state().body().unwrap_or_default().to_string();
+        let (blocks, _) = notecraft_formats::boxes::read(format, &saved);
+        let notecraft_formats::Block::Paragraph(spans) = &blocks[0] else { panic!("paragraph expected") };
+        assert_eq!(spans.iter().map(|span| span.text.as_str()).collect::<String>(), "Replacement", "{format:?}: {saved}");
+        assert!(spans.iter().all(|span| span.bold == spans[0].bold), "{format:?}: replacement has one consistent formatting state: {saved}");
+    }
+}
+
 #[test]
 fn legacy_font_marks_toggle_partial_selection_without_losing_other_styles() {
     let (_t, app, s) = sample_app("ui-partial-legacy-marks");
@@ -10309,8 +10450,11 @@ fn partial_selection_keeps_font_family_when_script_is_added() {
         ask(&mut h, "ui.key", json!({"key": "ArrowRight", "shift": true})).expect("select");
         pump(&mut h);
     }
-    h.get_by_label("Font Family").click();
+    h.get_by_label("Font name").click();
     h.run();
+    ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select the box text");
+    ask(&mut h, "ui.text", json!({"text": family.to_string()})).expect("type the font name");
+    settle(&mut h);
     h.get_by_label(&family).click();
     settle(&mut h);
     h.get_by_label("Subscript").click();
@@ -10519,8 +10663,11 @@ fn selected_container_font_family_is_undoable_and_leaves_other_boxes_alone() {
     let (_t, mut h, _, (ox, oy)) = two_boxes("ui-box-font-family");
     select_box_by_handle(&mut h, ox, oy, 160.0);
     let before = h.state().body().unwrap_or_default().to_string();
-    h.get_by_label("Font Family").click();
+    h.get_by_label("Font name").click();
     h.run();
+    ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select the box text");
+    ask(&mut h, "ui.text", json!({"text": family.to_string()})).expect("type the font name");
+    settle(&mut h);
     h.get_by_label(&family).click();
     settle(&mut h);
     let after = h.state().body().unwrap_or_default().to_string();
@@ -10552,7 +10699,19 @@ fn missing_page_fonts_are_visible_in_both_formats() {
         notecraft_store::page::save_body(page, body).expect("write fixture");
         h.state_mut().open_path(&page.to_string_lossy());
         settle(&mut h);
-        assert!(h.query_all_by_label_contains("These fonts could not be loaded").count() > 0, "a missing family is reported for {}", page.display());
+        // The font is looked up on a background thread, so the notice appears a few frames later.
+        let mut reported = false;
+        // A time limit, not a count: a slow machine still gets the time it needs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            settle(&mut h);
+            if h.query_all_by_label_contains("These fonts could not be loaded").count() > 0 {
+                reported = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(reported, "a missing family is reported for {}", page.display());
         assert!(h.state().body().unwrap_or_default().contains("NoteCraft Missing Font 928474"), "the name stays on the page");
     }
 }
@@ -11217,6 +11376,36 @@ fn normal_on_the_current_code_line_closes_the_block_before_it() {
     );
 }
 
+#[test]
+fn normal_on_a_new_trailing_code_line_splits_after_the_last_enter() {
+    let (_t, app, s) = sample_app("ui-code-split-trailing-blank-normal");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\n```123|rust\nline one\nline two\nline three\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let inspect = ask(&mut h, "ui.inspect", json!({})).expect("inspect");
+    let blocks = inspect.pointer("/page/blocks").and_then(Value::as_u64).expect("block count") as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret into code");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Enter"})).expect("make a trailing blank code line");
+    settle(&mut h);
+    let caret = ask(&mut h, "ui.inspect", json!({})).expect("inspect the new line");
+    assert_eq!(caret.pointer("/page/caret/text").and_then(Value::as_str), Some("line one\nline two\nline three\n"));
+
+    let more = h.get_by_label("More styles").rect();
+    ask(&mut h, "ui.click", json!({"x": more.center().x, "y": more.center().y})).expect("open Styles gallery");
+    settle(&mut h);
+    let normal = h.query_all_by_label("Normal").last().expect("Normal style").rect();
+    ask(&mut h, "ui.click", json!({"x": normal.center().x, "y": normal.center().y})).expect("apply Normal");
+    settle(&mut h);
+    let split = ask(&mut h, "ui.inspect", json!({})).expect("inspect split");
+    assert_eq!(split.pointer("/page/blocks").and_then(Value::as_u64), Some((blocks + 1) as u64));
+    assert_eq!(split.pointer("/page/caret/text").and_then(Value::as_str), Some(""), "the caret moved to the new Normal paragraph");
+}
+
 /// Applying Normal to the selected middle code line keeps the lines around it in the code block.
 #[test]
 fn normal_on_a_selected_code_line_splits_only_that_line() {
@@ -11262,6 +11451,101 @@ fn normal_on_a_selected_code_line_splits_only_that_line() {
         file.contains("```123|rust\nline one\n```\n\nline two\n\n```123|rust\nline three\n```"),
         "Normal should split only the selected code line:\n{file}"
     );
+}
+
+#[test]
+fn normal_on_a_selected_multiline_code_range_splits_every_selected_line() {
+    let (_t, app, s) = sample_app("ui-code-split-multiline-normal");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\n```123|rust\nline one\nline two\nline three\nline four\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let blocks = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret into code");
+    settle(&mut h);
+    for _ in 0..2 {
+        ask(&mut h, "ui.key", json!({"key": "ArrowUp"})).expect("move to line two");
+        settle(&mut h);
+    }
+    ask(&mut h, "ui.key", json!({"key": "Home"})).expect("start of line two");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "ArrowDown", "shift": true})).expect("extend to line three");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "End", "shift": true})).expect("select through line three");
+    settle(&mut h);
+    let selected = ask(&mut h, "ui.inspect", json!({})).expect("inspect selection");
+    let caret = selected.pointer("/page/caret").expect("caret remains in code");
+    assert_eq!(caret["anchor"], 9, "selection starts on line two: {caret}");
+    assert_eq!(caret["at"], 28, "selection ends on line three: {caret}");
+
+    let more = h.get_by_label("More styles").rect();
+    ask(&mut h, "ui.click", json!({"x": more.center().x, "y": more.center().y})).expect("open Styles gallery");
+    settle(&mut h);
+    let normal = h.query_all_by_label("Normal").last().expect("Normal style").rect();
+    ask(&mut h, "ui.click", json!({"x": normal.center().x, "y": normal.center().y})).expect("apply Normal");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("leave code so it saves");
+    settle(&mut h);
+    for _ in 0..60 {
+        pump(&mut h);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let file = std::fs::read_to_string(s.md_page.join("index.md")).unwrap_or_default();
+    assert!(
+        file.contains("```123|rust\nline one\n```\n\nline two\n\nline three\n\n```123|rust\nline four\n```"),
+        "Normal should split each selected line and preserve code around the range:\n{file}"
+    );
+}
+
+#[test]
+fn normal_on_newly_typed_selected_code_lines_keeps_the_unselected_prefix() {
+    let (_t, app, s) = sample_app("ui-code-split-newly-typed-selection");
+    let file = s.md_page.join("index.md");
+    let md = std::fs::read_to_string(&file).expect("page");
+    std::fs::write(&file, format!("{md}\n```123|rust\nline one\nline two\nline three\n```\n")).expect("write");
+    let mut app = app;
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 1400.0));
+    settle(&mut h);
+    let inspect = ask(&mut h, "ui.inspect", json!({})).expect("inspect");
+    let blocks = inspect.pointer("/page/blocks").and_then(Value::as_u64).expect("block count") as usize;
+    ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret into code");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Enter"})).expect("add a code line");
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "line four"})).expect("type first new line");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Enter"})).expect("add another code line");
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "line five"})).expect("type second new line");
+    settle(&mut h);
+
+    ask(&mut h, "ui.key", json!({"key": "ArrowUp"})).expect("move to line four");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Home"})).expect("start line four");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "ArrowDown", "shift": true})).expect("extend into line five");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "End", "shift": true})).expect("select line five");
+    settle(&mut h);
+    let selected = ask(&mut h, "ui.inspect", json!({})).expect("inspect selection");
+    let caret = selected.pointer("/page/caret").expect("caret remains in code");
+    assert_eq!(caret["text"], "line one\nline two\nline three\nline four\nline five");
+    assert_eq!(caret["anchor"], 29, "the selection starts at the first newly typed line");
+    assert_eq!(caret["at"], 48, "the selection ends at the second newly typed line");
+
+    let more = h.get_by_label("More styles").rect();
+    ask(&mut h, "ui.click", json!({"x": more.center().x, "y": more.center().y})).expect("open Styles gallery");
+    settle(&mut h);
+    let normal = h.query_all_by_label("Normal").last().expect("Normal style").rect();
+    ask(&mut h, "ui.click", json!({"x": normal.center().x, "y": normal.center().y})).expect("apply Normal");
+    settle(&mut h);
+    let split = ask(&mut h, "ui.inspect", json!({})).expect("inspect split");
+    assert_eq!(split.pointer("/page/blocks").and_then(Value::as_u64), Some((blocks + 2) as u64));
+    assert_eq!(split.pointer("/page/caret/text").and_then(Value::as_str), Some("line four"));
 }
 
 /// Up inside a numbered code block moves the caret one line up and keeps the block in edit mode.
@@ -13489,4 +13773,140 @@ fn a_merged_cell_is_drawn_across_its_columns_without_a_line_through_it() {
             painted_segments(&h).iter().any(|[a, b]| (a.x - b.x).abs() < 0.5 && (a.x - mid_x).abs() < 3.0 && a.y.min(b.y) < y1 && a.y.max(b.y) > y0);
         assert!(!through, "html={html}: no line between the merged columns in the merged row");
     }
+}
+
+/// Typing a script's name lists the fonts of that script, so an Arabic font is found by typing
+/// "Arabic" rather than by scrolling to it.
+#[test]
+fn typing_a_script_name_lists_its_fonts() {
+    let Ok(catalog) = notecraft_ui_egui::fonts::system_catalog() else { return };
+    let Some(name) = catalog
+        .families()
+        .iter()
+        .find(|n| {
+            notecraft_formats::markdown::valid_font_family(n)
+                && catalog.scripts(n).contains(&notecraft_ui_egui::font_picker::Script::Arabic)
+                && !n.to_lowercase().contains("arabic")
+        })
+        .cloned()
+    else {
+        return;
+    };
+    let (_t, app, s) = sample_app("ui-font-script-search");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(2000.0, 900.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+    settle(&mut h);
+    h.get_by_label("Font name").click();
+    h.run();
+    ask(&mut h, "ui.key", json!({"key": "a", "ctrl": true})).expect("select the box text");
+    ask(&mut h, "ui.text", json!({"text": "Arabic"})).expect("type the script name");
+    settle(&mut h);
+    h.get_by_label(name.as_str());
+}
+
+/// Dragging in the navigation pane, as in OneNote: a page up or down its section, onto another
+/// page to make it a subpage, onto a section in the other column to move it there; notebooks
+/// among notebooks. Escape while dragging puts it back, and a short press is still a click.
+#[test]
+fn notebooks_sections_and_pages_are_dragged_where_they_go() {
+    let (_t, app, s) = sample_app("ui-nav-drag");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1400.0, 900.0));
+    settle(&mut h);
+    let run = |h: &mut Harness<'_, NoteCraftApp>, command: &str, p: Value| -> String {
+        ask(h, "engine.execute", json!({"command": command, "params": p})).expect(command).as_str().expect("a path").to_string()
+    };
+    let root = s.notebook.parent().expect("the notebooks folder").to_path_buf();
+    let course = run(&mut h, "notebook.create", json!({"name": "Course"}));
+    let lectures = run(&mut h, "node.create", json!({"parent": course, "kind": "section", "title": "Lectures"}));
+    let archive = run(&mut h, "node.create", json!({"parent": course, "kind": "section", "title": "Old lectures"}));
+    let pages: Vec<String> =
+        ["Alpha", "Beta", "Gamma"].iter().map(|t| run(&mut h, "node.create", json!({"parent": lectures, "kind": "page", "title": t}))).collect();
+    ask(&mut h, "ui.open", json!({"path": pages[0]})).expect("open Alpha");
+    settle(&mut h);
+    let titles = |h: &Harness<'_, NoteCraftApp>, parent: &str| -> Vec<String> {
+        fn find<'a>(nodes: &'a [notecraft_store::tree::Node], p: &std::path::Path) -> Option<&'a notecraft_store::tree::Node> {
+            nodes.iter().find_map(|n| if n.path == p { Some(n) } else { find(&n.children, p) })
+        }
+        let p = std::fs::canonicalize(parent).unwrap_or_else(|_| PathBuf::from(parent));
+        find(h.state().session().tree(), &p)
+            .map(|n| n.children.iter().filter(|c| c.info.kind == notecraft_model::NodeKind::Page).map(|c| c.info.title.clone()).collect())
+            .unwrap_or_default()
+    };
+    // The rows a title names, last first: the pages column is drawn after the organisers.
+    let row = |h: &Harness<'_, NoteCraftApp>, title: &str| -> egui::Rect {
+        h.get_all_by_label(title).last().unwrap_or_else(|| panic!("a row for {title}")).rect()
+    };
+    let drag = |h: &mut Harness<'_, NoteCraftApp>, from: egui::Pos2, to: egui::Pos2, escape: bool| {
+        ask(h, "ui.press", json!({"x": from.x, "y": from.y})).expect("press");
+        pump(h);
+        for step in 1..=8 {
+            let at = from + (to - from) * (step as f32 / 8.0);
+            ask(h, "ui.move", json!({"x": at.x, "y": at.y})).expect("move");
+            pump(h);
+        }
+        if escape {
+            ask(h, "ui.key", json!({"key": "Escape"})).expect("escape");
+            pump(h);
+        }
+        ask(h, "ui.release", json!({"x": to.x, "y": to.y})).expect("release");
+        settle(h);
+    };
+    assert_eq!(titles(&h, &lectures), ["Alpha", "Beta", "Gamma"]);
+
+    // Gamma dragged to the top edge of Alpha goes first.
+    let (gamma, alpha) = (row(&h, "Gamma"), row(&h, "Alpha"));
+    drag(&mut h, gamma.center(), egui::pos2(alpha.center().x, alpha.min.y + 2.0), false);
+    assert_eq!(titles(&h, &lectures), ["Gamma", "Alpha", "Beta"], "dropped above Alpha");
+
+    // Escape while carrying it leaves everything where it was.
+    let (gamma, beta) = (row(&h, "Gamma"), row(&h, "Beta"));
+    drag(&mut h, gamma.center(), egui::pos2(beta.center().x, beta.max.y - 2.0), true);
+    assert_eq!(titles(&h, &lectures), ["Gamma", "Alpha", "Beta"], "Escape put it back");
+
+    // Beta dropped on the middle of Alpha becomes its subpage.
+    let (beta, alpha) = (row(&h, "Beta"), row(&h, "Alpha"));
+    drag(&mut h, beta.center(), alpha.center(), false);
+    assert_eq!(titles(&h, &lectures), ["Gamma", "Alpha"], "Beta left the top level");
+    let alpha_path = std::fs::canonicalize(&pages[0]).expect("alpha");
+    assert_eq!(titles(&h, &alpha_path.to_string_lossy()), ["Beta"], "and is Alpha's subpage");
+
+    // Gamma dragged onto another section moves there.
+    let (gamma, archive_row) = (row(&h, "Gamma"), h.get_all_by_label("Old lectures").next().expect("the section's row").rect());
+    drag(&mut h, gamma.center(), archive_row.center(), false);
+    assert_eq!(titles(&h, &archive), ["Gamma"], "Gamma is in Old lectures");
+    assert_eq!(titles(&h, &lectures), ["Alpha"]);
+
+    // Sections among sections: Old lectures dragged above Lectures.
+    let sections = |h: &Harness<'_, NoteCraftApp>| {
+        let c = std::fs::canonicalize(&course).expect("course");
+        h.state()
+            .session()
+            .tree()
+            .iter()
+            .find(|n| n.path == c)
+            .map(|n| n.children.iter().map(|c| c.info.title.clone()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    assert_eq!(sections(&h), ["New Section 1", "Lectures", "Old lectures"]);
+    let (old, lect) = (h.get_all_by_label("Old lectures").next().expect("row").rect(), h.get_all_by_label("Lectures").next().expect("row").rect());
+    drag(&mut h, old.center(), egui::pos2(lect.center().x, lect.min.y + 2.0), false);
+    assert_eq!(sections(&h), ["New Section 1", "Old lectures", "Lectures"], "the section went above");
+
+    // The notebooks: Course dragged above the sample notebook goes first, and stays first.
+    let notebooks = |h: &Harness<'_, NoteCraftApp>| h.state().session().tree().iter().map(|n| n.info.title.clone()).collect::<Vec<_>>();
+    let first = notebooks(&h)[0].clone();
+    assert_ne!(first, "Course");
+    let (course_row, first_row) =
+        (h.get_all_by_label("Course").next().expect("Course").rect(), h.get_all_by_label(first.as_str()).next().expect("first").rect());
+    drag(&mut h, course_row.center(), egui::pos2(first_row.center().x, first_row.min.y + 2.0), false);
+    assert_eq!(notebooks(&h)[0], "Course", "Course is first: {:?}", notebooks(&h));
+    let _ = root;
+
+    // A press that hardly moves is still a click: it opens the page.
+    let alpha = row(&h, "Alpha");
+    ask(&mut h, "ui.click", json!({"x": alpha.center().x, "y": alpha.center().y})).expect("click");
+    settle(&mut h);
+    assert_eq!(ask(&mut h, "ui.inspect", json!({})).expect("inspect")["page"]["title"], json!("Alpha"), "the click opened Alpha");
 }
