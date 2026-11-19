@@ -86,7 +86,6 @@ fn font_row(ui: &mut Ui, name: &str, current: bool, preview: bool, wanted: &mut 
         let width = ui.available_width().max(0.0);
         ui.allocate_ui_with_layout(egui::vec2(width, height), egui::Layout::left_to_right(Align::Center), |ui| {
             // A taller face is clipped to the slot rather than spilling into the rows below.
-            ui.set_clip_rect(ui.max_rect());
             ui.add_space(INDENT);
             ui.selectable_label(current, name_text(ui, name, preview))
         })
@@ -396,6 +395,55 @@ mod tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn a_long_grouped_list_stays_inside_its_popup() {
+        // Renders the family list with many families in four script groups, and saves the picture so the
+        // popup's edge can be checked by eye.
+        let names: Vec<String> = (0..300).map(|i| format!("Family {i:03}")).collect();
+        let sections: Vec<(String, Vec<String>)> = (0..4).map(|g| (format!("Group {g}"), names[g * 75..(g + 1) * 75].to_vec())).collect();
+        let mut h = egui_kittest::Harness::builder().wgpu().build_ui(|ui| {
+            let accept = |_: &str| true;
+            show(
+                ui,
+                egui::Color32::BLACK,
+                Spec {
+                    id: egui::Id::new("long-font-list"),
+                    box_label: "Font name",
+                    arrow_label: "Font Family",
+                    shown: "Family 000",
+                    width: 96.0,
+                    items: &names,
+                    empty_note: None,
+                    accept: &accept,
+                    filter: true,
+                    recent: &[],
+                    missing: false,
+                    preview: true,
+                    sections: &sections,
+                    add_font: Some("Add Font…"),
+                    usage: "test",
+                    tokens: crate::theme::Theme::all()[0].tokens(),
+                },
+            );
+        });
+        h.run();
+        h.get_by_label("Font Family").click();
+        h.run();
+        h.run();
+        let picture = h.render().expect("render");
+        // The popup ends near the field's bottom edge (about y 330 at this size). Below it there must
+        // be no font names: a name there means the rows paint past the popup's scroll area.
+        let (width, height) = picture.dimensions();
+        let below_popup_has_text = (340..height.min(600)).any(|y| {
+            (40..width.min(120)).any(|x| {
+                // Transparent pixels are the background; only opaque dark ones are ink.
+                let p = picture.get_pixel(x, y);
+                p[3] > 200 && (u16::from(p[0]) + u16::from(p[1]) + u16::from(p[2])) / 3 < 100
+            })
+        });
+        assert!(!below_popup_has_text, "font names are drawn below the popup's bottom edge");
+    }
 
     #[test]
     fn the_add_font_row_shows_when_the_list_is_empty() {
