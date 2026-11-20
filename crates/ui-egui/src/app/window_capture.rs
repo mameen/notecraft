@@ -13,7 +13,7 @@ impl NoteCraftApp {
         self.native_close.replace(false)
     }
 
-    pub(super) fn request_window_close(&self, ctx: &Context) {
+    pub(crate) fn request_window_close(&self, ctx: &Context) {
         if self.native_hosted {
             self.native_close.set(true);
             ctx.request_repaint();
@@ -128,8 +128,14 @@ impl NoteCraftApp {
         if cfg!(any(target_arch = "wasm32", target_os = "android", target_os = "ios")) {
             return;
         }
-        // This window's own writes under way are not another's: looked at once they are done.
-        if self.page_conflict || self.saver.busy() || self.ink_saving.is_some() || self.page_revision.is_none() {
+        // This window's own writes under way are not another's: looked at once they are done,
+        // and external reloads wait until any in-progress stroke finishes.
+        if self.page_conflict
+            || self.saver.busy()
+            || self.ink_saving.is_some()
+            || self.page_revision.is_none()
+            || self.pad.as_ref().is_some_and(crate::inkpad::Pad::stroke_in_progress)
+        {
             return;
         }
         if self.pad.as_ref().is_some_and(|pad| pad.dirty && !pad.matches_disk()) {
