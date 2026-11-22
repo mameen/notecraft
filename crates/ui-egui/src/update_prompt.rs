@@ -23,25 +23,29 @@ pub static NOTECRAFT: App = App {
 
 /// The prompt's words, in the interface language. The crate looks each English text up here.
 pub fn translate(text: &str, args: &[(&str, &str)]) -> String {
-    let id = match text {
-        "{app} {version} is available with the latest features and bug fixes." => "ui.update_prompt.available",
-        "by {developer}" => "ui.update_prompt.by_developer",
-        "v{from} to {to}" => "ui.update_prompt.version_change",
-        "What's new" => "ui.update_prompt.whats_new",
-        "Download" => "ui.update_prompt.download",
-        "{app} {version} is the newest version available." => "ui.update_prompt.newest_available",
-        "Later" => "ui.update_prompt.later",
-        "Dismiss" => "ui.update_prompt.dismiss",
-        "All releases are listed at {url}" => "ui.update_prompt.all_releases",
-        "Update" => "ui.update_prompt.update",
-        "Restart to Update" => "ui.update_prompt.restart_to_update",
-        "Update and Restart" => "ui.update_prompt.update_and_restart",
-        "Downloading and installing update…" => "ui.update_prompt.downloading",
-        "Close" => "ui.update_prompt.close",
-        _ => return craft_update::translate::english(text, args),
-    };
-    crate::i18n::format_message_id(id, args)
+    match UPDATE_PROMPT_IDS.iter().find(|(english, _)| *english == text) {
+        Some((_, id)) => crate::i18n::format_message_id(id, args),
+        None => craft_update::translate::english(text, args),
+    }
 }
+
+/// The prompt's English words and their catalog IDs in `i18n/en.tsv`.
+const UPDATE_PROMPT_IDS: &[(&str, &str)] = &[
+    ("{app} {version} is available with the latest features and bug fixes.", "ui.update_prompt.available"),
+    ("by {developer}", "ui.update_prompt.by_developer"),
+    ("v{from} to {to}", "ui.update_prompt.version_change"),
+    ("What's new", "ui.update_prompt.whats_new"),
+    ("Download", "ui.update_prompt.download"),
+    ("{app} {version} is the newest version available.", "ui.update_prompt.newest_available"),
+    ("Later", "ui.update_prompt.later"),
+    ("Dismiss", "ui.update_prompt.dismiss"),
+    ("All releases are listed at {url}", "ui.update_prompt.all_releases"),
+    ("Update", "ui.update_prompt.update"),
+    ("Restart to Update", "ui.update_prompt.restart_to_update"),
+    ("Update and Restart", "ui.update_prompt.update_and_restart"),
+    ("Downloading and installing update…", "ui.update_prompt.downloading"),
+    ("Close", "ui.update_prompt.close"),
+];
 
 /// The repository the prompt and its downloads come from. NoteCraft's own releases only.
 pub const REPO: &str = "AlienTechSoftware/notecraft";
@@ -98,44 +102,91 @@ pub fn offer_named(version: &str) -> Updater {
 /// Used only with `--update-from`, for testing an update before a release is published.
 pub fn check_from_folder(running: &str, folder: &std::path::Path) -> Updater {
     let folder = folder.to_path_buf();
-    let source: CheckSource = Arc::new(move || {
-        let sums_text =
-            std::fs::read_to_string(folder.join("SHA256SUMS.txt")).map_err(|e| format!("no SHA256SUMS.txt in {} ({e})", folder.display()))?;
-        let sums = craft_update::release::parse_sha256sums(&sums_text);
-        let (msi_name, msi_hash) = sums
-            .iter()
-            .find(|(_, name)| name.ends_with("-windows-x64.msi"))
-            .map(|(hash, name)| (name.clone(), hash.clone()))
-            .ok_or_else(|| "SHA256SUMS.txt lists no windows-x64 installer".to_string())?;
-        let version_text = msi_name.trim_start_matches("notecraft-").split('-').next().unwrap_or("").to_string();
-        let version = craft_update::version::parse(&version_text);
-        let url = |name: &str| format!("file:///{}", folder.join(name).display().to_string().replace(char::from(92u8), "/"));
-        let size = std::fs::metadata(folder.join(&msi_name)).map(|m| m.len()).unwrap_or(0);
-        Ok(Some(Release {
-            tag: format!("v{version_text}"),
-            version,
-            name: format!("NoteCraft {version_text}"),
-            html_url: crate::backstage::LATEST_RELEASE.to_string(),
-            assets: vec![
-                craft_update::release::Asset { name: msi_name.clone(), size, url: url(&msi_name), sha256: Some(msi_hash) },
-                craft_update::release::Asset {
-                    name: "SHA256SUMS.txt".to_string(),
-                    size: sums_text.len() as u64,
-                    url: url("SHA256SUMS.txt"),
-                    sha256: None,
-                },
-            ],
-            ..Release::default()
-        }))
-    });
+    let source: CheckSource = Arc::new(move || release_from_folder(&folder).map(Some));
     let installable = craft_update::self_update::is_self_updating(&NOTECRAFT);
     Updater::new(&NOTECRAFT, running).with_translator(translate).with_installable(installable).with_source(source)
+}
+
+/// The release a folder offers: the Windows installer named in its `SHA256SUMS.txt`, with the
+/// checksum the installer must match. Files are read as `file:` addresses.
+fn release_from_folder(folder: &std::path::Path) -> Result<Release, String> {
+    let sums_text = std::fs::read_to_string(folder.join("SHA256SUMS.txt")).map_err(|e| format!("no SHA256SUMS.txt in {} ({e})", folder.display()))?;
+    let sums = craft_update::release::parse_sha256sums(&sums_text);
+    let (msi_name, msi_hash) = sums
+        .iter()
+        .find(|(_, name)| name.ends_with("-windows-x64.msi"))
+        .map(|(hash, name)| (name.clone(), hash.clone()))
+        .ok_or_else(|| "SHA256SUMS.txt lists no windows-x64 installer".to_string())?;
+    let version_text = msi_name.trim_start_matches("notecraft-").split('-').next().unwrap_or("").to_string();
+    let version = craft_update::version::parse(&version_text);
+    let url = |name: &str| format!("file:///{}", folder.join(name).display().to_string().replace(char::from(92u8), "/"));
+    let size = std::fs::metadata(folder.join(&msi_name)).map(|m| m.len()).unwrap_or(0);
+    Ok(Release {
+        tag: format!("v{version_text}"),
+        version,
+        name: format!("NoteCraft {version_text}"),
+        html_url: crate::backstage::LATEST_RELEASE.to_string(),
+        assets: vec![
+            craft_update::release::Asset { name: msi_name.clone(), size, url: url(&msi_name), sha256: Some(msi_hash) },
+            craft_update::release::Asset {
+                name: "SHA256SUMS.txt".to_string(),
+                size: sums_text.len() as u64,
+                url: url("SHA256SUMS.txt"),
+                sha256: None,
+            },
+        ],
+        ..Release::default()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use craft_update::release::Release;
+
+    #[test]
+    fn every_prompt_word_has_an_english_entry_in_the_catalog() {
+        for (english, _) in UPDATE_PROMPT_IDS {
+            let shown = translate(
+                english,
+                &[("app", "NoteCraft"), ("version", "0.0.14"), ("developer", "NoteCraft"), ("url", "u"), ("from", "1"), ("to", "2")],
+            );
+            assert!(!shown.contains("[missing UI translation]"), "{english:?} has no catalog entry");
+            if !english.contains('{') {
+                assert_eq!(shown, *english, "the English words are shown as written");
+            }
+        }
+    }
+
+    /// A SHA-256 checksum is 64 hexadecimal characters.
+    const HASH: &str = "abababababababababababababababababababababababababababababababab";
+
+    #[test]
+    fn a_folder_offers_its_windows_installer_with_the_checksum_it_must_match() {
+        let t = notecraft_store::testing::TempDir::new("update-folder");
+        std::fs::write(t.path().join("notecraft-0.0.14-windows-x64.msi"), b"installer").expect("installer");
+        std::fs::write(t.path().join("SHA256SUMS.txt"), format!("{HASH}  notecraft-0.0.14-windows-x64.msi\n")).expect("sums");
+
+        let release = release_from_folder(t.path()).expect("the folder offers a release");
+        assert_eq!(release.tag, "v0.0.14");
+        let installer = release.assets.iter().find(|a| a.name.ends_with(".msi")).expect("the installer is an asset");
+        assert_eq!(installer.sha256.as_deref(), Some(HASH), "the installer must match the listed checksum");
+        assert_eq!(installer.size, 9, "the size is the installer's real size");
+        assert!(installer.url.starts_with("file:///") && !installer.url.contains('\\'), "a file address with forward slashes: {}", installer.url);
+        let sums = release.assets.iter().find(|a| a.name == "SHA256SUMS.txt").expect("the sums are an asset");
+        assert_eq!(sums.sha256, None, "the sums file is not checked against itself");
+    }
+
+    #[test]
+    fn a_folder_without_sums_or_without_a_windows_installer_offers_nothing() {
+        let t = notecraft_store::testing::TempDir::new("update-folder-bad");
+        let missing = release_from_folder(t.path()).expect_err("no sums file");
+        assert!(missing.contains("no SHA256SUMS.txt"), "{missing}");
+
+        std::fs::write(t.path().join("SHA256SUMS.txt"), format!("{HASH}  notecraft-0.0.14-macos.dmg\n")).expect("sums");
+        let no_installer = release_from_folder(t.path()).expect_err("no windows installer listed");
+        assert_eq!(no_installer, "SHA256SUMS.txt lists no windows-x64 installer");
+    }
 
     /// The prompt opens for a newer release, with no window: egui runs its frames headlessly.
     #[test]

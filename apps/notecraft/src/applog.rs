@@ -10,7 +10,7 @@
 //! eframe and the window and GPU glue, which is where start-up problems show.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use web_time::{SystemTime, UNIX_EPOCH};
 
@@ -22,9 +22,7 @@ static PATH: OnceLock<PathBuf> = OnceLock::new();
 pub fn init(dir: PathBuf, debug: bool) {
     let file = dir.join("notecraft.log");
     let _ = std::fs::create_dir_all(&dir);
-    if std::fs::metadata(&file).map(|m| m.len() > MAX_BYTES).unwrap_or(false) {
-        let _ = std::fs::rename(&file, dir.join("notecraft.log.old"));
-    }
+    rotate_if_large(&file);
     let _ = PATH.set(file);
     if log::set_logger(&Logger).is_ok() {
         log::set_max_level(if debug || rust_log_requests_debug() { log::LevelFilter::Debug } else { log::LevelFilter::Info });
@@ -47,12 +45,23 @@ fn rust_log_requests_debug_from(value: &str) -> bool {
         .any(|directive| matches!(directive, "debug" | "trace") || directive.ends_with("=debug") || directive.ends_with("=trace"))
 }
 
+/// Moves the log aside when it is over the size limit, so the next line starts a new file.
+fn rotate_if_large(file: &Path) {
+    if std::fs::metadata(file).map(|m| m.len() > MAX_BYTES).unwrap_or(false) {
+        let _ = std::fs::rename(file, file.with_file_name("notecraft.log.old"));
+    }
+}
+
+/// Appends one `time level text` line to `file`, opening it for this line only.
+fn append_to(file: &Path, time: &str, level: &str, text: &str) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+    writeln!(f, "{time} {level} {text}")
+}
+
 /// Appends one line, `time level text`. Never fails the caller.
 pub fn line(level: &str, text: &str) {
     let Some(path) = PATH.get() else { return };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{} {level} {text}", utc_now());
-    }
+    let _ = append_to(path, &utc_now(), level, text);
 }
 
 pub fn info(text: &str) {
@@ -61,14 +70,19 @@ pub fn info(text: &str) {
 
 struct Logger;
 
+/// Which records are kept: every warning and error, and the information from NoteCraft and from
+/// the window and GPU glue. Other libraries' information is left out.
+fn keeps(target: &str, level: log::Level) -> bool {
+    level <= log::Level::Warn
+        || target.starts_with("notecraft")
+        || target.starts_with("eframe")
+        || target.starts_with("egui_wgpu")
+        || target.starts_with("egui_winit")
+}
+
 impl log::Log for Logger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        let t = m.target();
-        m.level() <= log::Level::Warn
-            || t.starts_with("notecraft")
-            || t.starts_with("eframe")
-            || t.starts_with("egui_wgpu")
-            || t.starts_with("egui_winit")
+        keeps(m.target(), m.level())
     }
 
     fn log(&self, r: &log::Record) {
@@ -110,6 +124,40 @@ mod tests {
         assert_eq!(format_utc(0), "1970-01-01 00:00:00");
         assert_eq!(format_utc(951_782_400), "2000-02-29 00:00:00");
         assert_eq!(format_utc(1_792_340_000), "2026-10-18 16:13:20");
+    }
+
+    #[test]
+    fn a_large_log_is_moved_aside_and_a_small_one_is_kept() {
+        let t = notecraft_store::testing::TempDir::new("applog-rotate");
+        let file = t.path().join("notecraft.log");
+        std::fs::write(&file, vec![b'x'; MAX_BYTES as usize]).expect("a log at the limit");
+        rotate_if_large(&file);
+        assert!(file.exists(), "a log at exactly the limit is kept");
+
+        std::fs::write(&file, vec![b'x'; MAX_BYTES as usize + 1]).expect("a log over the limit");
+        rotate_if_large(&file);
+        assert!(!file.exists(), "a log over the limit is moved aside");
+        assert_eq!(std::fs::metadata(t.path().join("notecraft.log.old")).expect("the old log").len(), MAX_BYTES + 1);
+    }
+
+    #[test]
+    fn each_line_is_time_level_and_text_and_lines_append() {
+        let t = notecraft_store::testing::TempDir::new("applog-append");
+        let file = t.path().join("notecraft.log");
+        append_to(&file, "2026-11-21 10:00:00", "INFO", "started").expect("first line");
+        append_to(&file, "2026-11-21 10:00:01", "WARN", "slow start").expect("second line");
+        assert_eq!(std::fs::read_to_string(&file).expect("the log"), "2026-11-21 10:00:00 INFO started\n2026-11-21 10:00:01 WARN slow start\n");
+    }
+
+    #[test]
+    fn warnings_and_our_information_are_kept_and_other_libraries_information_is_not() {
+        assert!(keeps("hyper::client", log::Level::Error), "errors from any library are kept");
+        assert!(keeps("hyper::client", log::Level::Warn), "warnings from any library are kept");
+        assert!(!keeps("hyper::client", log::Level::Info), "a library's information is left out");
+        for ours in ["notecraft", "notecraft_ui_egui::app", "eframe::native", "egui_wgpu::renderer", "egui_winit::clipboard"] {
+            assert!(keeps(ours, log::Level::Info), "{ours} information is kept");
+        }
+        assert!(!keeps("egui::context", log::Level::Info), "egui's own information is left out, eframe's is kept");
     }
 
     #[test]
