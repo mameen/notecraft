@@ -114,6 +114,11 @@ measured. It covers the workspace without `xtask`. A run is compared with its ow
 only, because code for one platform counts only where it is built. `--update` writes the
 current platform and keeps the others. `badges` holds the README figures, with "not measured"
 for a platform that has no baseline yet. Linux is measured in CI; Windows on a Windows machine.
+The Linux baseline updates itself: the Coverage baseline workflow
+([`coverage-baseline.yml`](../.github/workflows/coverage-baseline.yml)) measures coverage after
+every successful CI run on main and lands the new figure through the merge queue. Windows and
+macOS are still manual: when a change raises coverage on one of them, run `--update` on that
+platform in the same pull request, so the new figure lands with the code that earned it.
 
 The comparison warns and never fails. A figure that falls by more than 0.5 points is printed
 as a warning, and the task still succeeds. On a pull request the `coverage` job in

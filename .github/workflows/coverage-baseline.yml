@@ -1,0 +1,211 @@
+# Coverage baseline: keeps the Linux entry in docs/coverage.json fresh on main.
+#
+# The coverage baseline is one entry per platform in docs/coverage.json: total
+# line, function and region coverage, line coverage per crate, and when and with
+# what it was measured. `cargo xtask coverage` compares a run with its own
+# platform's baseline and warns on a drop of more than 0.5 points; it never
+# blocks. Until now the baseline was updated by hand (`cargo xtask coverage
+# --update` in a pull request), so it went stale: the Linux figure was a month
+# old.
+#
+# This workflow updates the Linux baseline after every successful CI run on
+# main. It measures coverage on the commit CI just validated, writes the new
+# baseline with `cargo xtask coverage --update`, and lands it through the merge
+# queue like any other change, so the baseline gets CI before it lands.
+#
+# Guards:
+# - The new total must be at or above the 80% floor. Below that the job fails
+#   and no pull request is opened; that is a real regression, not a baseline.
+# - A drop of more than 0.5 points opens the pull request but does not queue
+#   it, so a human sees it first. Anything else is queued automatically.
+# - If the numbers did not change, no pull request is opened.
+#
+# Linux only. CI measures Linux today; Windows and macOS stay manual until
+# they get coverage jobs of their own.
+#
+# Needs: the nightly GitHub App (installed on this repo, Contents and Pull
+# requests read and write) with its App ID and private key in the
+# NIGHTLY_APP_ID and NIGHTLY_APP_PRIVATE_KEY secrets. The App token opens the
+# pull request: GITHUB_TOKEN cannot, because a pull request it opens gets no
+# CI without a manual approval, and the queue needs the PR's own checks to
+# pass before it can enter. Reusing the nightly App is deliberate: it is
+# already on main's push list, which auto-merge enablement requires.
+name: Coverage baseline
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-baseline
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  update:
+    name: Update the Linux baseline
+    # Only after a green CI run on main. A manual dispatch runs unconditionally.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # Find the existing baseline PR and read its queue state. All writes go
+      # through the nightly App token (see the mint step below).
+      pull-requests: read
+    env:
+      NC_LLVM_COV_VERSION: "0.9.1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Measure the commit CI validated, not whatever main has moved to
+          # since. A manual dispatch measures main.
+          ref: ${{ github.event.workflow_run.head_sha || 'main' }}
+          # No persisted credential: checkout would store a GITHUB_TOKEN
+          # Authorization header that overrides the App token in the branch
+          # push URL below. Every write in this job carries its own token.
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgtk-3-dev libfontconfig1-dev libfreetype-dev libvulkan1 mesa-vulkan-drivers
+      - name: Install Rust and LLVM tools
+        run: |
+          rustup install
+          rustup component add llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Restore the tool after rust-cache: binaries present before that action
+      # starts are excluded from its saved cache. Keep this cache to one file.
+      - name: Cache coverage tool
+        id: coverage-tool-cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-ubuntu24-${{ runner.arch }}-${{ env.NC_LLVM_COV_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
+      - name: Ensure pinned coverage tool
+        run: |
+          if [[ "$(cargo llvm-cov --version 2>/dev/null || true)" != "cargo-llvm-cov $NC_LLVM_COV_VERSION" ]]; then
+            cargo install cargo-llvm-cov --locked --version "$NC_LLVM_COV_VERSION" --force
+          fi
+          coverage_tool_version="$(cargo llvm-cov --version)"
+          echo "$coverage_tool_version"
+          [[ "$coverage_tool_version" == "cargo-llvm-cov $NC_LLVM_COV_VERSION" ]]
+      - name: Measure and write the new Linux baseline
+        run: cargo xtask coverage --update
+      - name: Check the new baseline
+        id: check
+        run: |
+          set -euo pipefail
+          old="$(git show "HEAD:docs/coverage.json" 2>/dev/null | jq -r '.platforms.linux.total.lines // empty' || true)"
+          new="$(jq -r '.platforms.linux.total.lines' docs/coverage.json)"
+          echo "Linux total lines: ${old:-none} -> $new"
+          if [ -z "$(git status --porcelain docs/coverage.json)" ]; then
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            echo "No change in the Linux baseline." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "changed=true" >>"$GITHUB_OUTPUT"
+          below_floor="$(awk -v n="$new" 'BEGIN { print (n < 80.0) ? "yes" : "no" }')"
+          if [ "$below_floor" = yes ]; then
+            echo "::error::Linux coverage fell to $new%, below the 80% floor. No pull request opened."
+            exit 1
+          fi
+          if [ -n "$old" ]; then
+            drop="$(awk -v o="$old" -v n="$new" 'BEGIN { print (o - n > 0.5) ? "yes" : "no" }')"
+          else
+            drop=no
+          fi
+          {
+            echo "old=$old"
+            echo "new=$new"
+            echo "drop=$drop"
+          } >>"$GITHUB_OUTPUT"
+      - name: Mint a token for the nightly App
+        id: app-token
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ secrets.NIGHTLY_APP_ID }}
+          private-key: ${{ secrets.NIGHTLY_APP_PRIVATE_KEY }}
+        # The token lives about an hour. It is used only in the next two steps
+        # (open the pull request, enable auto-merge), minutes after minting.
+      - name: Commit the new baseline and open its pull request
+        id: pr
+        if: steps.check.outputs.changed == 'true'
+        env:
+          OLD: ${{ steps.check.outputs.old }}
+          NEW: ${{ steps.check.outputs.new }}
+          DROP: ${{ steps.check.outputs.drop }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="chore/coverage-baseline-linux"
+          # A baseline PR already in the merge queue is left alone: the queued
+          # one lands, and the next merge triggers a fresh update. A queued
+          # branch rejects pushes, so pushing to it would only fail loudly.
+          queued_pr="$(gh pr list --head "$branch" --base main --json number,autoMergeRequest --jq '.[0] | select(.autoMergeRequest != null) | .number // empty')"
+          if [ -n "$queued_pr" ]; then
+            echo "Baseline pull request #$queued_pr is already queued; leaving it alone." | tee -a "$GITHUB_STEP_SUMMARY"
+            {
+              echo "number=$queued_pr"
+              echo "queued=true"
+            } >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git checkout -B "$branch"
+          git add docs/coverage.json
+          git commit -q -m "chore(coverage): update the Linux baseline to ${NEW}%" -m "Measured on main at $(git rev-parse --short HEAD)."
+          # Push the branch with the App token, to an explicit URL. The checkout
+          # stored no credential (persist-credentials: false), so nothing
+          # overrides the App token here. The push runs the LFS pre-push check
+          # over the branch history; the bump commit adds no LFS files, so allow
+          # the incomplete push (same as the nightly version bump).
+          git -c lfs.allowincompletepush=true push --force "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
+          # Reuse the pull request from an earlier run if one already exists
+          # for this branch, and refresh its title and body to the new numbers.
+          pr="$(gh pr list --head "$branch" --base main --json number --jq '.[0].number // empty')"
+          body="Linux coverage baseline, measured on main at $(git rev-parse --short HEAD)."
+          if [ -n "$OLD" ]; then body="$body Total lines: $OLD% -> $NEW%."; fi
+          if [ "$DROP" = yes ]; then body="$body This is a drop of more than 0.5 points, so it was left out of the merge queue for review."; fi
+          body="$body Opened by the Coverage baseline workflow."
+          if [ -z "$pr" ]; then
+            # gh pr create prints the pull request URL; it has no --json flag.
+            pr_url="$(gh pr create --title "chore(coverage): update the Linux baseline to ${NEW}%" --base main --head "$branch" --body "$body")"
+            pr="$(gh pr view "$pr_url" --json number --jq '.number')"
+          else
+            gh pr edit "$pr" --title "chore(coverage): update the Linux baseline to ${NEW}%" --body "$body"
+          fi
+          echo "number=$pr" >>"$GITHUB_OUTPUT"
+          echo "Baseline pull request: https://github.com/$GITHUB_REPOSITORY/pull/$pr" >>"$GITHUB_STEP_SUMMARY"
+      - name: Queue the baseline pull request
+        if: steps.check.outputs.changed == 'true' && steps.check.outputs.drop != 'yes' && steps.pr.outputs.queued != 'true'
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # With the merge queue enabled, auto-merge adds the pull request to
+          # the queue. It waits for PR CI, then the queue runs merge-group CI
+          # and merges it. A rerun may find auto-merge already on, or the PR
+          # merged. Reads use GITHUB_TOKEN (the job default); only the
+          # auto-merge call uses the App token, minutes after minting, well
+          # inside its hour.
+          read -r merged_at has_auto <<<"$(gh pr view "$PR" --json mergedAt,autoMergeRequest --jq '[.mergedAt // "null", (.autoMergeRequest != null)] | @tsv')"
+          if [ "$merged_at" = "null" ] && [ "$has_auto" != "true" ]; then
+            GH_TOKEN="$APP_TOKEN" gh pr merge --auto --merge "$PR"
+          fi
