@@ -141,7 +141,12 @@ fn row_name_room(name_width: f32, label_width: Option<f32>, room: f32) -> (bool,
 /// `text` as it fits in `room` points: whole when it fits, otherwise cut at a character
 /// and ended with "…", so a long name never runs into what is drawn after it.
 fn fit_to_width(ui: &Ui, text: &str, size: f32, room: f32) -> String {
-    if text_width(ui, text, size) <= room {
+    fit_with(&|s| text_width(ui, s, size), text, room)
+}
+
+/// [`fit_to_width`] with the width of a piece of text given by `width`.
+fn fit_with(width: &dyn Fn(&str) -> f32, text: &str, room: f32) -> String {
+    if width(text) <= room {
         return text.to_owned();
     }
     let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).skip(1).chain(std::iter::once(text.len())).collect();
@@ -150,7 +155,7 @@ fn fit_to_width(ui: &Ui, text: &str, size: f32, room: f32) -> String {
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
         let candidate = format!("{}…", text[..ends[mid - 1]].trim_end());
-        if text_width(ui, &candidate, size) <= room { lo = mid } else { hi = mid - 1 }
+        if width(&candidate) <= room { lo = mid } else { hi = mid - 1 }
     }
     if lo == 0 { "…".to_owned() } else { format!("{}…", text[..ends[lo - 1]].trim_end()) }
 }
@@ -4532,13 +4537,16 @@ impl NoteCraftApp {
         // title is on the hover of the words.
         // A phone-width window has no room for the title between the controls: the page's own
         // title is the first thing on it anyway.
+        let mut title_shown = false;
         if !self.compact {
             let start = left.min_rect().right() + 12.0;
             let end = right.min_rect().left() - 12.0;
             if end - start > 24.0 {
+                title_shown = true;
                 let size = 12.5;
-                let shown = fit_to_width(ui, &text, size, end - start);
-                let width = text_width(ui, &shown, size);
+                let measure = |s: &str| crate::bidi::line_width(ui, s, size, None);
+                let shown = fit_with(&measure, &text, end - start);
+                let width = measure(&shown);
                 let centre = band_title_centre(row.center().x, start, end, width);
                 let room = egui::Rect::from_min_max(egui::pos2(start, row.min.y), egui::pos2(end, row.max.y));
                 // A page named in Arabic puts the band's words in the wrong order if the whole
@@ -4546,13 +4554,20 @@ impl NoteCraftApp {
                 // page does. The name decides its own direction here; there is no page to follow.
                 let band = ui.painter_at(room);
                 crate::bidi::line_at(ui, &band, egui::pos2(centre, row.center().y), Align2::CENTER_CENTER, &shown, size, on.text, None);
+                let words = egui::Rect::from_center_size(egui::pos2(centre, row.center().y), vec2(width, H));
+                // Hover only: a press here still reaches the band's handle and moves the window.
+                // The full title is its accessible name, cut or not.
+                let hover = ui.interact(words, ui.id().with("title-words"), Sense::hover());
+                hover.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text.as_str()));
                 if shown != text {
-                    let words = egui::Rect::from_center_size(egui::pos2(centre, row.center().y), vec2(width, H));
-                    // Hover only: a press here still reaches the band's handle and moves the window.
-                    let hover = ui.interact(words, ui.id().with("title-words"), Sense::hover());
                     hover.on_hover_text(text.as_str());
                 }
             }
+        }
+        // Issue #371: with no room for the title in the band, its full text is on the band's
+        // hover instead, so it is never hidden without a way to read it.
+        if !title_shown {
+            handle.clone().on_hover_text(text.as_str());
         }
         ui.advance_cursor_after_rect(row);
     }
@@ -4577,6 +4592,7 @@ impl NoteCraftApp {
             egui::FontId::proportional(13.0),
             on.text,
         );
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Discord"));
         let resp = resp.on_hover_text(crate::tl_id!("ui.open_the_artcraft_discord"));
         if resp.clicked() {
             ui.ctx().open_url(egui::OpenUrl::new_tab(DISCORD_URL));
@@ -5374,7 +5390,7 @@ impl NoteCraftApp {
             let range = notecraft_model::container::blocks_of(&ed.boxes, index);
             let Some(blocks) = ed.blocks.get(range) else { return pageedit::FontSelection::default() };
             let spans = blocks.iter().flat_map(|block| match block {
-                Block::Heading { spans, .. } | Block::Paragraph(spans) | Block::Quote(spans) | Block::Item { spans, .. } => spans.as_slice(),
+                Block::Heading { spans, .. } | Block::Paragraph(spans, _) | Block::Quote(spans, _) | Block::Item { spans, .. } => spans.as_slice(),
                 _ => &[],
             });
             return pageedit::FontSelection::from_spans(spans);
@@ -5446,7 +5462,7 @@ impl NoteCraftApp {
         if range.end > ed.blocks.len() || range.is_empty() {
             return false;
         }
-        let words = |b: &Block| !matches!(b, Block::Code { .. } | Block::MathBlock(_)) && pageedit::is_one_line_of_words(b);
+        let words = |b: &Block| !matches!(b, Block::Code { .. } | Block::MathBlock(_, _)) && pageedit::is_one_line_of_words(b);
         match act {
             ribbon::Act::Clipboard(which) => {
                 crate::containers::ask_clipboard(ctx, *which == "cut");
@@ -5473,7 +5489,7 @@ impl NoteCraftApp {
                 Self::remember_step(ed);
                 let mut changed = false;
                 for block in ed.blocks.get_mut(range).unwrap_or_default() {
-                    if let Block::Heading { spans, .. } | Block::Paragraph(spans) | Block::Quote(spans) | Block::Item { spans, .. } = block {
+                    if let Block::Heading { spans, .. } | Block::Paragraph(spans, _) | Block::Quote(spans, _) | Block::Item { spans, .. } = block {
                         changed |= pageedit::format_span_range(spans, 0..usize::MAX, format.clone());
                     }
                 }
@@ -5543,7 +5559,7 @@ impl NoteCraftApp {
                 return true;
             }
             ribbon::Act::Justify(strength) => {
-                let paragraphs: Vec<usize> = range.filter(|i| matches!(ed.blocks.get(*i), Some(Block::Paragraph(_)))).collect();
+                let paragraphs: Vec<usize> = range.filter(|i| matches!(ed.blocks.get(*i), Some(Block::Paragraph(_, _)))).collect();
                 if paragraphs.is_empty() {
                     return true;
                 }
@@ -5650,7 +5666,7 @@ impl NoteCraftApp {
                     // What was written before is kept as it stood, so Undo takes back only the space.
                     Self::remember_step(ed);
                     let at = ed.caret.as_ref().map(|c| c.block + 1).unwrap_or(ed.blocks.len()).min(ed.blocks.len());
-                    ed.blocks.insert(at, notecraft_formats::Block::Paragraph(Vec::new()));
+                    ed.blocks.insert(at, notecraft_formats::Block::Paragraph(Vec::new(), Vec::new()));
                     let marks = ed.blocks_inserted(at, 1);
                     ed.rebuild_body();
                     ed.caret = Some(pageedit::Caret {
@@ -6016,7 +6032,7 @@ impl NoteCraftApp {
         }
         let at = ed.caret.as_ref().map_or(ed.blocks.len().saturating_sub(1), |c| c.block);
         if ed.blocks.is_empty() {
-            ed.blocks.push(notecraft_formats::markdown::Block::Paragraph(Vec::new()));
+            ed.blocks.push(notecraft_formats::markdown::Block::Paragraph(Vec::new(), Vec::new()));
         }
         let before = ed.blocks.len();
         pageedit::paste_at(&mut ed.blocks, &mut ed.caret, at, new);
@@ -6124,6 +6140,7 @@ impl NoteCraftApp {
                 src: link,
                 width: Some(crate::stickers::WIDTH),
                 height: Some(crate::stickers::WIDTH),
+                emoji: Vec::new(),
             },
         );
         let marks = ed.blocks_inserted(at, 1);
@@ -6146,7 +6163,13 @@ impl NoteCraftApp {
                     let at = ed.caret.as_ref().map_or(ed.blocks.len(), |c| c.block + 1).min(ed.blocks.len());
                     ed.blocks.insert(
                         at,
-                        notecraft_formats::markdown::Block::Image { alt: "Pasted picture".to_string(), src: link, width: None, height: None },
+                        notecraft_formats::markdown::Block::Image {
+                            alt: "Pasted picture".to_string(),
+                            src: link,
+                            width: None,
+                            height: None,
+                            emoji: Vec::new(),
+                        },
                     );
                     let marks = ed.blocks_inserted(at, 1);
                     ed.rebuild_body();
@@ -6304,7 +6327,7 @@ impl NoteCraftApp {
         // goes on the end of the page, so it is counted in the last box.
         for file in &files {
             if !ed.blocks.iter().any(|b| matches!(b, Block::Image { src, .. } if src.trim() == file)) {
-                ed.blocks.push(Block::Image { alt: "Ink".to_string(), src: file.clone(), width: None, height: None });
+                ed.blocks.push(Block::Image { alt: "Ink".to_string(), src: file.clone(), width: None, height: None, emoji: Vec::new() });
                 let at = ed.blocks.len() - 1;
                 ed.count_inserted_in_boxes(at, 1);
                 changed = true;
@@ -6927,7 +6950,7 @@ impl NoteCraftApp {
         let cols = ed.columns.remove_blocks(at..at + 1);
         let justified = ed.justified.remove_blocks(at..at + 1);
         if ed.blocks.is_empty() {
-            ed.blocks.push(Block::Paragraph(Vec::new()));
+            ed.blocks.push(Block::Paragraph(Vec::new(), Vec::new()));
             ed.count_inserted_in_boxes(0, 1);
         }
         pageedit::renumber(&mut ed.blocks);
@@ -7174,7 +7197,7 @@ impl NoteCraftApp {
                     }
                     found = true;
                 }
-                Block::Heading { spans, .. } | Block::Paragraph(spans) | Block::Quote(spans) | Block::Item { spans, .. } => {
+                Block::Heading { spans, .. } | Block::Paragraph(spans, _) | Block::Quote(spans, _) | Block::Item { spans, .. } => {
                     for span in spans.iter_mut().filter(|s| s.image.as_deref() == Some(src)) {
                         span.image = Some(link.clone());
                         found = true;
@@ -7358,8 +7381,8 @@ impl NoteCraftApp {
                 ed.blocks.get(caret.block),
                 Some(
                     notecraft_formats::Block::Heading { .. }
-                        | notecraft_formats::Block::Paragraph(_)
-                        | notecraft_formats::Block::Quote(_)
+                        | notecraft_formats::Block::Paragraph(_, _)
+                        | notecraft_formats::Block::Quote(_, _)
                         | notecraft_formats::Block::Item { .. }
                 )
             )
@@ -7567,8 +7590,8 @@ impl NoteCraftApp {
                 ed.blocks.get(caret.block),
                 Some(
                     notecraft_formats::Block::Heading { .. }
-                        | notecraft_formats::Block::Paragraph(_)
-                        | notecraft_formats::Block::Quote(_)
+                        | notecraft_formats::Block::Paragraph(_, _)
+                        | notecraft_formats::Block::Quote(_, _)
                         | notecraft_formats::Block::Item { .. }
                 )
             )
@@ -7626,8 +7649,8 @@ impl NoteCraftApp {
                     && matches!(
                         block,
                         notecraft_formats::Block::Heading { .. }
-                            | notecraft_formats::Block::Paragraph(_)
-                            | notecraft_formats::Block::Quote(_)
+                            | notecraft_formats::Block::Paragraph(_, _)
+                            | notecraft_formats::Block::Quote(_, _)
                             | notecraft_formats::Block::Item { .. }
                     )
                     && let Some(caret) = ed.caret.as_mut()
@@ -7688,8 +7711,8 @@ impl NoteCraftApp {
                 ed.blocks.get(caret.block),
                 Some(
                     notecraft_formats::Block::Heading { .. }
-                        | notecraft_formats::Block::Paragraph(_)
-                        | notecraft_formats::Block::Quote(_)
+                        | notecraft_formats::Block::Paragraph(_, _)
+                        | notecraft_formats::Block::Quote(_, _)
                         | notecraft_formats::Block::Item { .. }
                 )
             )
@@ -7721,8 +7744,8 @@ impl NoteCraftApp {
         let spans = match ed.blocks.get_mut(block) {
             Some(
                 notecraft_formats::Block::Heading { spans, .. }
-                | notecraft_formats::Block::Paragraph(spans)
-                | notecraft_formats::Block::Quote(spans)
+                | notecraft_formats::Block::Paragraph(spans, _)
+                | notecraft_formats::Block::Quote(spans, _)
                 | notecraft_formats::Block::Item { spans, .. },
             ) => spans,
             _ => {
@@ -7807,8 +7830,8 @@ impl NoteCraftApp {
                     ed.blocks.get(caret.block),
                     Some(
                         notecraft_formats::Block::Heading { .. }
-                            | notecraft_formats::Block::Paragraph(_)
-                            | notecraft_formats::Block::Quote(_)
+                            | notecraft_formats::Block::Paragraph(_, _)
+                            | notecraft_formats::Block::Quote(_, _)
                             | notecraft_formats::Block::Item { .. }
                     )
                 )
@@ -7844,8 +7867,8 @@ impl NoteCraftApp {
         let spans = match ed.blocks.get_mut(caret.block) {
             Some(
                 notecraft_formats::Block::Heading { spans, .. }
-                | notecraft_formats::Block::Paragraph(spans)
-                | notecraft_formats::Block::Quote(spans)
+                | notecraft_formats::Block::Paragraph(spans, _)
+                | notecraft_formats::Block::Quote(spans, _)
                 | notecraft_formats::Block::Item { spans, .. },
             ) if lo == 0 && hi == len => Some(spans),
             _ => None,
@@ -7945,7 +7968,7 @@ impl NoteCraftApp {
             self.status_is_error = false;
             return;
         };
-        if !matches!(ed.blocks.get(at), Some(notecraft_formats::Block::Paragraph(_))) {
+        if !matches!(ed.blocks.get(at), Some(notecraft_formats::Block::Paragraph(_, _))) {
             self.say(crate::tl_id!("ui.justification_goes_on_a_paragraph_of_text"));
             return;
         }
@@ -7982,7 +8005,7 @@ impl NoteCraftApp {
         use notecraft_formats::Block;
         let Some(ed) = self.editor.as_mut() else { return };
         let text: Vec<usize> =
-            blocks.iter().copied().filter(|i| matches!(ed.blocks.get(*i), Some(Block::Paragraph(_) | Block::Heading { .. }))).collect();
+            blocks.iter().copied().filter(|i| matches!(ed.blocks.get(*i), Some(Block::Paragraph(_, _) | Block::Heading { .. }))).collect();
         if text.is_empty() {
             self.say(crate::tl_id!("ui.alignment_goes_on_a_paragraph_or_a_heading"));
             return;
@@ -8037,7 +8060,7 @@ impl NoteCraftApp {
         };
         let text: Vec<usize> = blocks
             .into_iter()
-            .filter(|i| matches!(ed.blocks.get(*i), Some(Block::Paragraph(_) | Block::Heading { .. } | Block::Item { .. } | Block::Quote(_))))
+            .filter(|i| matches!(ed.blocks.get(*i), Some(Block::Paragraph(_, _) | Block::Heading { .. } | Block::Item { .. } | Block::Quote(_, _))))
             .collect();
         if text.is_empty() {
             self.say(crate::tl_id!("ui.spacing_goes_on_text"));
@@ -8328,7 +8351,7 @@ impl NoteCraftApp {
         pageedit::needs_our_caret(&caret.text)
             && !matches!(
                 ed.blocks.get(caret.block),
-                Some(notecraft_formats::markdown::Block::Code { .. }) | Some(notecraft_formats::markdown::Block::MathBlock(_))
+                Some(notecraft_formats::markdown::Block::Code { .. }) | Some(notecraft_formats::markdown::Block::MathBlock(_, _))
             )
     }
 
@@ -10352,7 +10375,10 @@ impl NoteCraftApp {
     }
 
     fn page_save_state(&self, ed: &Editor) -> String {
-        if ed.dirty_since.is_some() || ed.saving.is_some() {
+        // Issue #371: a save in flight says so, apart from edits not yet written.
+        if ed.saving.is_some() {
+            crate::tl_id!("ui.saving").into()
+        } else if ed.dirty_since.is_some() {
             crate::tl_id!("ui.editing").into()
         } else {
             self.saved_caption(ed.last_saved.as_deref())
@@ -10370,8 +10396,21 @@ impl NoteCraftApp {
     fn status_bar(&mut self, ui: &mut Ui) {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let color = if self.status_is_error { self.tokens.warn } else { self.tokens.muted };
-                ui.label(egui::RichText::new(crate::i18n::pseudo_dynamic(&self.status)).color(color));
+                // Issue #371: an error gets its own mark and a heavier weight, not only a colour.
+                let shown = crate::i18n::pseudo_dynamic(&self.status);
+                let line = if self.status_is_error {
+                    egui::RichText::new(format!("! {shown}")).strong().color(self.tokens.warn)
+                } else {
+                    egui::RichText::new(shown).color(self.tokens.muted)
+                };
+                // Cut to the room the footer's controls leave, with the whole line on hover, so a
+                // long error never pushes the default-format control out of view.
+                let whole = self.status.clone();
+                let status_room = (ui.available_width() - 480.0).max(160.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(status_room);
+                    ui.add(egui::Label::new(line).truncate()).on_hover_text(whole);
+                });
                 if let Some(ed) = self.editor.as_ref() {
                     let state = self.page_save_state(ed);
                     ui.separator();
@@ -10382,6 +10421,9 @@ impl NoteCraftApp {
                 // labels or the folder summary, so the status beside it stays readable.
                 let compact = self.compact;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (current, source) = self.session.settings.global_format();
+                    // Issue #371: counts, the folder and where the default comes from sit behind
+                    // one Details control, so the footer keeps its save state and format in view.
                     if !compact {
                         let nodes: usize = self.session.tree().iter().map(|n| n.count()).sum();
                         let notebooks = crate::i18n::format_count_id("ui.n_notebook_n_notebooks", self.session.tree().len() as u64);
@@ -10391,10 +10433,14 @@ impl NoteCraftApp {
                             "ui.notebooks_items_folder",
                             &[("notebooks", &notebooks), ("items", &items), ("folder", &folder)],
                         );
-                        ui.label(egui::RichText::new(summary).small().color(self.tokens.muted));
+                        let inherited = format!("({})", crate::tl!(source.label()));
+                        let details = ui.button(crate::tl_id!("ui.notebook_details"));
+                        egui::Popup::menu(&details).show(|ui| {
+                            ui.label(egui::RichText::new(summary).small().color(self.tokens.muted));
+                            ui.label(egui::RichText::new(inherited).small().color(self.tokens.muted));
+                        });
                         ui.separator();
                     }
-                    let (current, source) = self.session.settings.global_format();
                     let mut chosen = current;
                     let combo = if compact {
                         egui::ComboBox::from_id_salt("default-format")
@@ -10409,7 +10455,6 @@ impl NoteCraftApp {
                     if compact {
                         combo.response.on_hover_text(crate::tl_id!("ui.default_format"));
                     } else {
-                        ui.label(egui::RichText::new(format!("({})", crate::tl!(source.label()))).small().color(self.tokens.muted));
                         ui.label(egui::RichText::new(crate::tl_id!("ui.new_pages")).small().color(self.tokens.muted));
                     }
                     if chosen != current && self.run("settings.default_format.set", &params(&[("format", chosen.id())])).is_some() {
@@ -12490,7 +12535,7 @@ impl NoteCraftApp {
                 e.blocks
                     .iter()
                     .filter_map(|b| match b {
-                        notecraft_formats::markdown::Block::Code { lang, text } if lang == "mermaid" => Some(text.clone()),
+                        notecraft_formats::markdown::Block::Code { lang, text, .. } if lang == "mermaid" => Some(text.clone()),
                         _ => None,
                     })
                     .collect()
@@ -14004,7 +14049,7 @@ mod alert_tests {
                     ed.boxes = vec![notecraft_model::container::Container::new(0.0, 0.0, 600.0, ed.blocks.len())];
                 }
                 let line = ed.blocks.len();
-                ed.blocks.push(notecraft_formats::Block::Paragraph(Vec::new()));
+                ed.blocks.push(notecraft_formats::Block::Paragraph(Vec::new(), Vec::new()));
                 ed.boxes = notecraft_model::container::append(&ed.boxes, line, 1, 300.0, 0.0, 0.0);
                 let index = ed.boxes.len() - 1;
                 (ed.boxes[index].x, ed.boxes[index].y) = (400.0, 2000.0);
@@ -14324,7 +14369,7 @@ mod literal_formatting_tests {
         let mut session = Session::new(temp.path(), settings).expect("session");
         let sample = notecraft_engine::sample::create_sample(&mut session, None).expect("sample");
         let text = r"*literal* $5 or $6 [x](y) C:\Users\name";
-        let original = vec![Block::Paragraph(vec![Span { text: text.into(), bold: true, ..Default::default() }])];
+        let original = vec![Block::Paragraph(vec![Span { text: text.into(), bold: true, ..Default::default() }], Vec::new())];
         let body = notecraft_formats::blocks_to_html(&original);
         session.run("page.save", &params(&[("path", &sample.html_page.to_string_lossy()), ("body", &body)])).expect("save");
         let mut app = NoteCraftApp::new(session);
@@ -14335,7 +14380,7 @@ mod literal_formatting_tests {
         app.save_now();
         let page = notecraft_store::page::load_page(&sample.html_page).expect("reopen");
         let blocks = notecraft_formats::boxes::read(page.format, &page.body).0;
-        assert_eq!(blocks, vec![Block::Paragraph(vec![Span { text: text.into(), ..Default::default() }])]);
+        assert_eq!(blocks, vec![Block::Paragraph(vec![Span { text: text.into(), ..Default::default() }], Vec::new())]);
     }
 
     fn opened_literal_page(blocks: &[Block], format: notecraft_model::PageFormat) -> (notecraft_store::testing::TempDir, NoteCraftApp, PathBuf) {
@@ -14364,6 +14409,7 @@ mod literal_formatting_tests {
                     vec![Span { text: "keep".into(), italic: true, ..Default::default() }],
                 ],
                 rows: Vec::new(),
+                emoji: Vec::new(),
             }];
             let (_temp, mut app, path) = opened_literal_page(&original, format);
             let ed = app.editor.as_mut().expect("editor");
@@ -14387,7 +14433,7 @@ mod literal_formatting_tests {
     fn copy_and_cut_keep_one_line_literal_text_and_rich_styles() {
         for format in notecraft_model::PageFormat::ALL {
             let text = "*literal* $5 or $6";
-            let original = vec![Block::Paragraph(vec![Span { text: text.into(), bold: true, ..Default::default() }])];
+            let original = vec![Block::Paragraph(vec![Span { text: text.into(), bold: true, ..Default::default() }], Vec::new())];
             let (_temp, mut app, _path) = opened_literal_page(&original, format);
             let ed = app.editor.as_mut().expect("editor");
             let source = pageedit::caret_text(&ed.blocks[0]);
@@ -14408,8 +14454,8 @@ mod literal_formatting_tests {
     #[test]
     fn copying_across_blocks_keeps_literal_delimiters() {
         let blocks = vec![
-            Block::Paragraph(vec![Span { text: "*left*".into(), ..Default::default() }]),
-            Block::Paragraph(vec![Span { text: "$5 or $6".into(), ..Default::default() }]),
+            Block::Paragraph(vec![Span { text: "*left*".into(), ..Default::default() }], Vec::new()),
+            Block::Paragraph(vec![Span { text: "$5 or $6".into(), ..Default::default() }], Vec::new()),
         ];
         let (_temp, mut app, _path) = opened_literal_page(&blocks, notecraft_model::PageFormat::Html);
         let ed = app.editor.as_mut().expect("editor");
@@ -14567,7 +14613,7 @@ mod structural_undo_tests {
         settle(&mut h);
         let left = blocks(&h);
         assert_eq!(left.len(), 1, "one empty line is left: {left:?}");
-        assert!(matches!(&left[0], Block::Paragraph(spans) if spans.is_empty()), "{left:?}");
+        assert!(matches!(&left[0], Block::Paragraph(spans, _) if spans.is_empty()), "{left:?}");
         assert_eq!(h.state().editor.as_ref().and_then(|e| e.caret.as_ref()).map(|c| c.block), Some(0));
     }
 
