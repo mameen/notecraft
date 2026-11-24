@@ -165,7 +165,7 @@ index 0000000..f4394fb
 +        let notebook = Path::new(ROOT).join("welcome-to-notecraft");
 +        let bytes = fetch("./welcome-notebook.zip").await.ok_or_else(|| "The release Welcome notebook could not be downloaded".to_string())?;
 +        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("The release Welcome notebook archive is invalid: {e}"))?;
-+        if archive.len() > 1000 {
++        if archive.len() > 5000 {
 +            return Err("The release Welcome notebook archive contains too many files".into());
 +        }
 +        let mut files = Vec::with_capacity(archive.len());
@@ -181,7 +181,7 @@ index 0000000..f4394fb
 +                return Err("The Welcome notebook archive has an unexpected path".into());
 +            }
 +            total = total.saturating_add(entry.size());
-+            if total > 40 * 1024 * 1024 || entry.size() > 20 * 1024 * 1024 {
++            if total > 200 * 1024 * 1024 || entry.size() > 20 * 1024 * 1024 {
 +                return Err("The Welcome notebook archive is larger than expected".into());
 +            }
 +            let mut content = Vec::with_capacity(entry.size() as usize);
@@ -203,8 +203,8 @@ index 0000000..f4394fb
 +                    (first == format && second.len() == 5 && second.as_bytes()[0].is_ascii_digit()).then_some(second.to_owned())
 +                })
 +                .collect::<std::collections::HashSet<_>>();
-+            if languages.len() != 13 {
-+                return Err(format!("The {format} Welcome notebook has {} language folders; expected 13", languages.len()));
++            if languages.len() != 14 {
++                return Err(format!("The {format} Welcome notebook has {} language folders; expected 14", languages.len()));
 +            }
 +        }
 +        WELCOME.with_borrow_mut(|w| *w = files);

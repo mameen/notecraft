@@ -2531,7 +2531,17 @@ fn a_swatch_overrides_the_system_mode() {
     app.follow_system_theme(Accent::Default);
     assert_eq!(app.mode_pref(), ModePref::System);
     let mut h = Harness::builder().with_size(egui::vec2(1200.0, 760.0)).build_ui_state(|ui, a: &mut NoteCraftApp| a.show(ui), app);
-    h.run();
+    // Step until the window stops asking for frames. Image decoding in the background can keep it
+    // asking past the harness's default step cap on a slow runner, so `run()` is not enough here.
+    let mut settled = false;
+    for _ in 0..300 {
+        h.step();
+        if !h.ctx.has_requested_repaint() {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "the window never settled: it still asks for frames after 300 steps");
     // The harness reports a dark system, so the swatch to prove the point is the light one.
     let system = h.state().theme().mode;
     let (other, label) = if system == Mode::Dark { (Mode::Light, "Theme Light Default") } else { (Mode::Dark, "Theme Dark Default") };
@@ -14315,7 +14325,7 @@ fn search_results_sit_under_the_field_show_where_and_follow_the_arrow_keys() {
     settle(&mut h);
     let picked = h
         .get_all_by_role(egui::accesskit::Role::Button)
-        .filter(|n| n.accesskit_node().label().is_some_and(|l| l.contains("Projects")))
+        .filter(|n| n.accesskit_node().label().is_some_and(|l| l.contains("Work > Projects)")))
         .find(|n| n.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True))
         .and_then(|n| n.accesskit_node().label())
         .expect("a result is chosen");
@@ -14323,6 +14333,64 @@ fn search_results_sit_under_the_field_show_where_and_follow_the_arrow_keys() {
     settle(&mut h);
     let title = ask(&mut h, "ui.inspect", json!({})).expect("inspect")["page"]["title"].as_str().unwrap_or_default().to_string();
     assert!(!title.is_empty() && picked.starts_with(&title), "Enter opens the chosen result: {picked} / {title}");
+}
+
+#[test]
+fn search_scope_applies_before_ranking_and_keeps_the_query() {
+    let (_t, app, s) = sample_app("ui-search-scope");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1280.0, 800.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    search_for(&mut h, "Level");
+    assert!(h.query_all_by_label_contains("Work > Projects)").count() > 0);
+    h.get_by_label("This section").click();
+    settle(&mut h);
+    assert_eq!(h.query_all_by_label_contains("Work > Projects)").count(), 0);
+    h.get_by_label("All notebooks").click();
+    settle(&mut h);
+    assert!(h.query_all_by_label_contains("Work > Projects)").count() > 0);
+    review(&mut h, "search_scope");
+}
+
+#[test]
+fn notebook_disclosure_changes_the_tree_without_opening_a_different_page() {
+    let (_t, app, s) = sample_app("ui-notebook-disclosure");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1280.0, 800.0));
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("Collapse Work").click();
+    settle(&mut h);
+    assert_eq!(h.query_all_by_label("Projects").count(), 0);
+    assert_eq!(look_at(&mut h)["page"]["title"], "Project X");
+    h.get_by_label("Expand Work").click();
+    settle(&mut h);
+    assert_eq!(h.query_all_by_label("Projects").count(), 1);
+    assert_eq!(look_at(&mut h)["page"]["title"], "Project X");
+    review(&mut h, "notebook_disclosure");
+}
+
+#[test]
+fn file_info_opens_a_notebook_by_its_named_action_and_options_group_settings() {
+    for theme in [LIGHT, DARK] {
+        let (_t, mut app, s) = sample_app("ui-file-navigation");
+        app.open_path(&s.md_page.to_string_lossy());
+        app.open_backstage_page("Info");
+        let mut h = sized_harness(app, theme, egui::vec2(820.0, 760.0));
+        settle(&mut h);
+        h.get_by_label("Back to the notebook");
+        review(&mut h, &format!("file_info_{}", theme.id()));
+        h.get_by_label("Open Archive").click();
+        settle(&mut h);
+        assert_eq!(h.query_all_by_label("Notebook information").count(), 0);
+
+        h.state_mut().open_backstage_page("Options");
+        settle(&mut h);
+        let appearance = h.get_by_role_and_label(egui::accesskit::Role::Label, "Appearance and language").rect();
+        let language = h.get_by_label("Interface language").rect();
+        let storage = h.get_by_role_and_label(egui::accesskit::Role::Label, "Notebook storage").rect();
+        assert!(appearance.bottom() < language.top() && language.bottom() < storage.top());
+        review(&mut h, &format!("file_options_{}", theme.id()));
+    }
 }
 
 /// Issue #369: the tab row has a button listing every section, groups included, so a tab that
@@ -15121,4 +15189,40 @@ fn the_pointer_shows_the_move_cursor_over_a_new_blocks_bar() {
     h.input_mut().events.push(egui::Event::PointerMoved(bar));
     h.run();
     assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Move, "the move cursor over the bar");
+}
+
+/// A paragraph's emoji header sits under the paragraph, and a heading's sits above it; the frame
+/// of a box keeps its header above (issue #441 follow-up on the block header row).
+// Ignored until the UI/UX of a paragraph's emoji header is decided (see PARAGRAPH_HEADER_BELOW).
+#[ignore = "paragraph emoji placement is undecided; see PARAGRAPH_HEADER_BELOW"]
+#[test]
+fn a_paragraph_emoji_header_sits_under_the_paragraph() {
+    let (_t, app, s) = sample_app("ui-paragraph-emoji-below");
+    let body = "<h2 data-nc-emoji=\"\u{1F929}\">Heading</h2><p data-nc-emoji=\"\u{1F631}\">Paragraph words</p>";
+    notecraft_store::page::save_body(&s.html_page, body).expect("a heading and a paragraph with emoji");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    let words = h.query_all_by_label_contains("Paragraph words").next().expect("the paragraph").rect();
+    let chip = h.query_all_by_label("Remove \u{1F631} from block 2").next().expect("the paragraph's emoji").rect();
+    assert!(chip.min.y > words.max.y, "the paragraph's emoji is under its words: chip {chip:?}, words {words:?}");
+    let title = h.query_all_by_label("Heading").map(|n| n.rect()).find(|r| r.min.x > 300.0 && r.min.y > 150.0).expect("the heading on the page");
+    let heading_chip = h.query_all_by_label("Remove \u{1F929} from block 1").next().expect("the heading's emoji").rect();
+    assert!(heading_chip.max.y <= title.min.y + 1.0, "a heading's emoji stays above it: chip {heading_chip:?}, heading {title:?}");
+}
+
+/// Paragraphs draw no emoji `+` and show no emoji; their data is kept. A heading keeps its `+`,
+/// and the box's top block keeps its header above the frame.
+#[test]
+fn paragraphs_draw_no_plus_and_keep_the_box_top_header() {
+    let (_t, app, s) = sample_app("ui-paragraph-no-plus");
+    let body = "<h2>Plain heading</h2><p>Plain paragraph</p><div class=\"nc-box\" data-x=\"0\" data-y=\"0\" data-width=\"400\"><h2>Boxed heading</h2><p>Boxed paragraph</p></div>";
+    notecraft_store::page::save_body(&s.html_page, body).expect("a heading, a paragraph and a box");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    assert_eq!(h.query_all_by_label("Add emoji to block 1").count(), 1, "the top block keeps its +");
+    assert_eq!(h.query_all_by_label("Add emoji to block 2").count(), 0, "a paragraph draws no +");
+    assert_eq!(h.query_all_by_label("Add emoji to block 3").count(), 1, "a heading in a box keeps its +");
+    assert_eq!(h.query_all_by_label("Add emoji to block 4").count(), 0, "a paragraph in a box draws no +");
 }
