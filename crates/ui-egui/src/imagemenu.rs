@@ -1,4 +1,5 @@
-//! The context menu for an image: "Save picture as...", and Rotate and Flip (issue #273).
+//! The context menu for an image: "Save picture as...", Copy Text from Picture (issue #274),
+//! and Rotate and Flip (issue #273).
 //!
 //! Opened when an image in the note is right-clicked.
 
@@ -18,16 +19,19 @@ pub fn id() -> egui::Id {
     egui::Id::new("image-menu")
 }
 
+/// The block of the picture the menu is open for, kept beside its state: two copies of one
+/// picture share a source but are two pictures.
+fn block_id() -> egui::Id {
+    id().with("block")
+}
+
 /// Validates that `src` is a safe path within `page_dir/assets/` and reads the original file bytes
 /// without re-encoding. Returns the resolved file path on disk, default file name, and raw bytes.
 pub fn validate_and_read_image(page_dir: &Path, src: &str) -> Result<(PathBuf, String, Vec<u8>), std::io::Error> {
-    let rel = src.strip_prefix("assets/").ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path must begin with assets/"))?;
-    if rel.is_empty() || rel.contains("..") || rel.contains('\\') || rel.starts_with('/') {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"));
-    }
-    let source_path = page_dir.join("assets").join(rel);
+    let source_path =
+        crate::preview::page_asset_path(page_dir, src).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid asset path"))?;
     let bytes = std::fs::read(&source_path)?;
-    let default_name = Path::new(rel).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "picture.png".to_owned());
+    let default_name = source_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "picture.png".to_owned());
     Ok((source_path, default_name, bytes))
 }
 
@@ -47,7 +51,10 @@ pub fn show(ui: &mut Ui, body: egui::Rect, acts: &mut Vec<Act>, t: &Tokens) {
         if let Some(hit) = hit_image {
             let at = pointer.unwrap_or(hit.rect.min);
             log::debug!("image menu: right-clicked at {:?} on {:?}", at, hit.src);
-            ui.data_mut(|d| d.insert_temp(id(), (at, hit.src)));
+            ui.data_mut(|d| {
+                d.insert_temp(id(), (at, hit.src));
+                d.insert_temp(block_id(), hit.block);
+            });
             crate::containers::claim_right_click(ui.ctx());
         } else {
             ui.data_mut(|d| d.remove::<(egui::Pos2, String)>(id()));
@@ -65,6 +72,30 @@ pub fn show(ui: &mut Ui, body: egui::Rect, acts: &mut Vec<Act>, t: &Tokens) {
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                 if floating::menu_row(ui, Some(Glyph::Icon(Icon::Picture)), crate::tl_id!("ui.save_picture_as"), t).clicked() {
                     acts.push(Act::SavePictureAs(src.clone()));
+                    picked = true;
+                }
+                // The printed text of the picture, or of a printout's page or every page (issue #274).
+                if crate::picture_text::printout_source(&src).is_some() {
+                    if floating::menu_row(ui, None, crate::tl_id!("ui.copy_text_from_this_printout_page"), t).clicked() {
+                        acts.push(Act::CopyTextFromPicture { src: src.clone(), whole_printout: false });
+                        picked = true;
+                    }
+                    if floating::menu_row(ui, None, crate::tl_id!("ui.copy_text_from_all_printout_pages"), t).clicked() {
+                        acts.push(Act::CopyTextFromPicture { src: src.clone(), whole_printout: true });
+                        picked = true;
+                    }
+                } else if floating::menu_row(ui, None, crate::tl_id!("ui.copy_text_from_picture"), t).clicked() {
+                    acts.push(Act::CopyTextFromPicture { src: src.clone(), whole_printout: false });
+                    picked = true;
+                }
+                // A picture or printout that shares a box with other blocks can be taken out of it
+                // where it stands, as dragging it out does, without the drag (issue #481).
+                if let Some(block) = ui.data(|d| d.get_temp::<usize>(block_id()))
+                    && crate::containers::can_unbox(ui.ctx(), block)
+                    && floating::menu_row(ui, None, crate::tl_id!("ui.take_out_of_box"), t).clicked()
+                {
+                    ui.data_mut(|d| d.insert_temp(crate::containers::unbox_request_id(), block));
+                    ui.ctx().request_repaint();
                     picked = true;
                 }
                 ui.separator();
@@ -295,5 +326,36 @@ mod tests {
         frame.textures_delta.clear();
 
         assert_eq!(state(&ctx), None);
+    }
+
+    /// The menu offers Copy Text from Picture for a picture, and for a printout's page both that
+    /// page and the whole printout (issue #274).
+    #[test]
+    fn copy_text_rows_fit_what_was_right_clicked() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+
+        let tokens = crate::theme::Theme::DEFAULT.tokens();
+        let body = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        for (src, label, whole) in [
+            ("assets/receipt.png", "Copy Text from Picture", false),
+            ("assets/report.pdf.printout-002.png", "Copy Text from This Page of the Printout", false),
+            ("assets/report.pdf.printout-002.png", "Copy Text from All Pages of the Printout", true),
+        ] {
+            let mut h = Harness::builder().with_size(egui::vec2(800.0, 600.0)).with_accessibility_check(false).build_ui_state(
+                |ui, acts: &mut Vec<Act>| {
+                    show(ui, body, acts, &tokens);
+                },
+                Vec::new(),
+            );
+            h.ctx.data_mut(|d| d.insert_temp(id(), (egui::pos2(100.0, 100.0), src.to_string())));
+            h.run();
+            let printout = src.contains(".printout-");
+            assert_eq!(h.query_by_label("Copy Text from Picture").is_some(), !printout, "{src}");
+            assert_eq!(h.query_by_label("Copy Text from All Pages of the Printout").is_some(), printout, "{src}");
+            h.get_by_label(label).click();
+            h.run();
+            assert_eq!(*h.state(), vec![Act::CopyTextFromPicture { src: src.to_string(), whole_printout: whole }]);
+        }
     }
 }

@@ -86,6 +86,8 @@ fn fetch_page_files(dir: &Path, wait: Duration) -> Option<std::sync::mpsc::Recei
     }
 }
 
+/// How far a pen may move in a tap that is still a click, in points (egui allows a mouse 6).
+const PEN_CLICK_DIST: f32 = 12.0;
 const AUTOSAVE_AFTER: Duration = Duration::from_millis(900);
 #[cfg(feature = "voice")]
 mod voice;
@@ -192,12 +194,18 @@ const INDENT: f32 = 14.0;
 
 /// Shared title treatment for modal dialogs. Keeping this here makes dialogs use the
 /// same opaque, theme-owned title band instead of inheriting egui's platform-gray title bar.
-fn modal_frame(tokens: &Tokens) -> egui::Frame {
+/// What the first-use wizard leaves around itself on a small screen: its frame's margin and
+/// stroke on both sides, and a gap to the screen's edge.
+const WIZARD_SCREEN_MARGIN: f32 = 2.0 * (16.0 + 2.0 + 8.0);
+/// The height kept below the wizard's scrolling body for its Back, Next and Finish buttons.
+const WIZARD_BUTTON_ROW: f32 = 56.0;
+
+pub(crate) fn modal_frame(tokens: &Tokens) -> egui::Frame {
     egui::Frame::NONE.fill(tokens.panel).stroke(egui::Stroke::new(1.5, tokens.accent)).inner_margin(egui::Margin::same(16))
 }
 
 // i18n-ui-text: title
-fn modal_title(ui: &mut Ui, tokens: &Tokens, title: &str) {
+pub(crate) fn modal_title(ui: &mut Ui, tokens: &Tokens, title: &str) {
     egui::Frame::NONE.fill(tokens.band).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(egui::RichText::new(crate::tl!(title)).strong().size(17.0).color(tokens.band_text));
@@ -208,7 +216,7 @@ fn modal_title(ui: &mut Ui, tokens: &Tokens, title: &str) {
 /// Dims the window behind a modal dialog and takes the clicks that miss the dialog, so they do
 /// not reach the page underneath. Returns the backdrop's layer: the dialog's window keeps itself
 /// above it with [`stay_above`].
-fn modal_backdrop(ctx: &egui::Context, id: &str) -> egui::LayerId {
+pub(crate) fn modal_backdrop(ctx: &egui::Context, id: &str) -> egui::LayerId {
     let screen = ctx.viewport_rect();
     egui::Area::new(egui::Id::new(id))
         .order(egui::Order::Foreground)
@@ -224,13 +232,13 @@ fn modal_backdrop(ctx: &egui::Context, id: &str) -> egui::LayerId {
 /// Keeps a modal dialog's window directly above its backdrop. Both are foreground areas, and egui
 /// raises an area that is clicked to the top of its order: a click on the dimmed backdrop used to
 /// lift it over the dialog, whose buttons could then never be reached again (issue #98).
-fn stay_above(ui: &Ui, backdrop: egui::LayerId) {
+pub(crate) fn stay_above(ui: &Ui, backdrop: egui::LayerId) {
     ui.ctx().set_sublayer(backdrop, ui.layer_id());
 }
 
 /// Modal actions use a readable size based on their label instead of egui's compact default.
 // i18n-ui-text: label
-fn modal_button(ui: &mut Ui, tokens: &Tokens, label: &str, primary: bool) -> egui::Response {
+pub(crate) fn modal_button(ui: &mut Ui, tokens: &Tokens, label: &str, primary: bool) -> egui::Response {
     modal_button_enabled(ui, tokens, label, primary, true)
 }
 
@@ -575,6 +583,15 @@ impl TagScope {
         }
     }
 
+    fn path(self, page: Option<&Path>) -> Option<PathBuf> {
+        match self {
+            Self::Page => page.map(Path::to_path_buf),
+            Self::Section => page.and_then(section_for),
+            Self::Notebook => page.and_then(notebook_for),
+            Self::All => None,
+        }
+    }
+
     fn id(self) -> &'static str {
         match self {
             TagScope::Page => "page",
@@ -698,6 +715,7 @@ struct PendingFormat {
 struct Editor {
     generation: u64,
     dir: PathBuf,
+    page_id: Option<String>,
     format: PageFormat,
     title: String,
     title_buf: String,
@@ -1045,6 +1063,7 @@ enum Dialog {
     NewNotebook {
         name: String,
         format: Option<PageFormat>,
+        first: bool,
     },
     Add {
         parent: PathBuf,
@@ -1361,6 +1380,10 @@ pub struct NoteCraftApp {
     tags_pane: Option<TagsPane>,
     /// Home > More tags > Customize Tags, while it is open (issue #259).
     custom_tags: Option<crate::customtags::Dialog>,
+    /// Copy Text from Picture while its dialog is open (issue #274).
+    picture_text: Option<crate::picture_text::Dialog>,
+    /// A paste meant for the text box of such a dialog, held while the page is drawn.
+    modal_paste: Option<String>,
     templates_pane: Option<TemplatesPane>,
     cursor: usize,
     tokens: Tokens,
@@ -1509,9 +1532,6 @@ pub struct NoteCraftApp {
     /// File > Account as it is being filled in (issue #304).
     account_choice: backstage::AccountChoice,
     portable: crate::portable::Choice,
-    /// Which pages the user has read, kept beside their settings (issue #291). Loaded the
-    /// first time it is needed.
-    read_state: Option<notecraft_store::read_state::ReadState>,
     /// The pages that are unread now, and when that was last worked out.
     unread: std::collections::HashSet<PathBuf>,
     unread_checked: Option<Instant>,
@@ -1655,6 +1675,8 @@ impl NoteCraftApp {
             search_scope: SearchScope::default(),
             tags_pane: None,
             custom_tags: None,
+            picture_text: None,
+            modal_paste: None,
             templates_pane: None,
             cursor: 0,
             tokens: Theme::DEFAULT.tokens(),
@@ -1731,7 +1753,6 @@ impl NoteCraftApp {
             copy_choice: backstage::CopyChoice::default(),
             account_choice: backstage::AccountChoice::default(),
             portable: crate::portable::Choice::default(),
-            read_state: None,
             unread: std::collections::HashSet::new(),
             unread_checked: None,
             full_page: false,
@@ -2840,10 +2861,12 @@ impl NoteCraftApp {
         }
     }
 
-    /// The user's read state, loaded from beside their settings the first time (issue #291).
-    fn read_state(&mut self) -> &mut notecraft_store::read_state::ReadState {
+    /// All native note windows share this file and their read/write operations run on the
+    /// same event-loop thread. Read it afresh so a later window does not write over marks
+    /// kept by a previous window since this one was opened.
+    fn read_state(&self) -> notecraft_store::read_state::ReadState {
         let file = self.session.settings.path().parent().unwrap_or(Path::new(".")).join("read-state.tsv");
-        self.read_state.get_or_insert_with(|| notecraft_store::read_state::ReadState::load(&file))
+        notecraft_store::read_state::ReadState::load(&file)
     }
 
     /// Records the page at `dir` as read as it stands. `opened` is true when the user opened
@@ -2852,7 +2875,7 @@ impl NoteCraftApp {
     fn note_read(&mut self, dir: &Path, opened: bool) {
         let Some(id) = notecraft_store::tree::read_node(dir).filter(|n| n.kind == NodeKind::Page).map(|n| n.id) else { return };
         let stamp = notecraft_store::read_state::page_stamp(dir);
-        let state = self.read_state();
+        let mut state = self.read_state();
         if !opened && state.is_marked_unread(&id) {
             return;
         }
@@ -2931,11 +2954,11 @@ impl NoteCraftApp {
             return;
         };
         let Some(id) = notecraft_store::tree::read_node(&dir).map(|n| n.id) else { return };
-        if self.read_state().is_marked_unread(&id) {
+        let mut state = self.read_state();
+        if state.is_marked_unread(&id) {
             self.note_read(&dir, true);
             self.say(crate::tl_id!("ui.marked_as_read"));
         } else {
-            let state = self.read_state();
             state.mark_unread(&id);
             if let Err(e) = state.save() {
                 log::warn!("could not keep the read state: {e}");
@@ -3300,6 +3323,11 @@ impl NoteCraftApp {
         }
         self.code = crate::codeview::State::default();
         let another_page = self.editor.as_ref().is_none_or(|e| e.dir != dir);
+        let refresh_tags = another_page
+            && self
+                .tags_pane
+                .as_ref()
+                .is_some_and(|pane| pane.scope != TagScope::All && pane.scope.path(self.current_page()) != pane.scope.path(Some(dir)));
         if let Some(Output::Page(page)) = self.run("page.load", &params(&[("path", &path_str(dir))])) {
             // A view belongs to the page it was made on: a pan kept showed every other page as far
             // off the screen, blank until the window was started again. Another page opens at its
@@ -3365,6 +3393,7 @@ impl NoteCraftApp {
                 generation: 0,
                 authors: notecraft_store::authors::of(dir),
                 dir: dir.to_path_buf(),
+                page_id: notecraft_store::tree::read_node(dir).map(|n| n.id).filter(|id| !id.is_empty()),
                 format: page.format,
                 title_buf,
                 titled: page.has_title,
@@ -3421,6 +3450,9 @@ impl NoteCraftApp {
             self.remember_last_page(dir, another_page);
             // Opened, so read (issue #291).
             self.note_read(dir, true);
+            if refresh_tags {
+                self.refresh_tags();
+            }
             self.say(crate::tl_id!("ui.opened"));
             self.page_revision = crate::windows::Revision::read(dir).ok();
         }
@@ -3956,7 +3988,7 @@ impl NoteCraftApp {
                 let kind = if parent_kind == NodeKind::Notebook || parent_kind == NodeKind::SectionGroup { NodeKind::Section } else { kind };
                 self.dialog = Some(Dialog::Add { parent, parent_kind, title: String::new(), kind, format: None });
             }
-            Act::NewNotebook => self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None }),
+            Act::NewNotebook => self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None, first: true }),
             Act::CloseNotebook(path) => {
                 self.save_now();
                 let was_showing = self.editor.as_ref().is_some_and(|ed| ed.dir.starts_with(&path));
@@ -4925,7 +4957,7 @@ impl NoteCraftApp {
                 }
                 backstage::Act::NewNotebook => {
                     self.backstage = None;
-                    self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None });
+                    self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None, first: true });
                 }
                 backstage::Act::OpenFolder(p) => self.reveal(&p),
                 backstage::Act::ChooseFolder => self.choose_notebooks_folder(),
@@ -5499,6 +5531,7 @@ impl NoteCraftApp {
             sensitivity: self.sensitivity,
             pressure_available: self.stylus.sample().pen,
             has_page: self.editor.is_some(),
+            has_recycle_notebook: self.recycle_notebook().is_some(),
             page_marked_unread: self.editor.as_ref().is_some_and(|e| self.unread.contains(&e.dir)),
             hide_authors: self.hide_authors,
             painting: self.painter.is_some(),
@@ -5823,7 +5856,7 @@ impl NoteCraftApp {
                 }
             }
             ribbon::Act::RecycleBin => {
-                if let Some(notebook) = self.editor.as_ref().and_then(|e| notebook_for(&e.dir)) {
+                if let Some(notebook) = self.recycle_notebook().map(Path::to_path_buf) {
                     self.open_recycle_bin(notebook, None);
                 }
             }
@@ -6077,9 +6110,17 @@ impl NoteCraftApp {
                     self.say(crate::tl_id!("ui.open_a_page_first"));
                     return;
                 };
-                ed.rule_colour = c;
+                if ed.locked {
+                    self.say(crate::tl_id!("ui.page_is_read_only"));
+                    return;
+                }
                 let path = path_str(&ed.dir);
-                self.run("page.paper", &params(&[("path", &path), ("rules", c.map(notecraft_model::NodeColor::id).unwrap_or("none"))]));
+                if self.run("page.paper", &params(&[("path", &path), ("rules", c.map(notecraft_model::NodeColor::id).unwrap_or("none"))])).is_none() {
+                    return;
+                }
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.rule_colour = c;
+                }
                 self.say(match c {
                     Some(c) => crate::i18n::format_message_id("ui.the_lines_are_colour", &[("colour", &crate::tl!(c.label()).to_lowercase())]),
                     None => crate::tl_id!("ui.the_lines_are_the_theme_s_own_colour").to_string(),
@@ -6120,6 +6161,7 @@ impl NoteCraftApp {
             ribbon::Act::InkExportPlain => self.ink_export_plain(),
             ribbon::Act::SavePictureAs(src) => self.save_picture_as(&src),
             ribbon::Act::TurnPicture(src, how) => self.turn_picture(&src, how),
+            ribbon::Act::CopyTextFromPicture { src, whole_printout } => self.copy_text_from_picture(&src, whole_printout),
         }
     }
 
@@ -6792,19 +6834,22 @@ impl NoteCraftApp {
             self.say("Open a page first");
             return;
         };
-        if let Some(p) = paper {
-            ed.paper = Some(p);
+        if ed.locked {
+            self.say(crate::tl_id!("ui.page_is_read_only"));
+            return;
         }
-        if let Some(c) = colour {
-            ed.colour = c;
-        }
-        let (path, paper, colour) = (path_str(&ed.dir), ed.paper, ed.colour);
+        let (path, paper, colour) = (path_str(&ed.dir), paper.or(ed.paper), colour.unwrap_or(ed.colour));
         let pairs: Vec<(&str, &str)> = vec![
             ("path", path.as_str()),
             ("paper", paper.map(ribbon::RuleLines::id).unwrap_or("none")),
             ("color", colour.map(notecraft_model::NodeColor::id).unwrap_or("none")),
         ];
-        self.run("page.paper", &params(&pairs));
+        if self.run("page.paper", &params(&pairs)).is_some()
+            && let Some(ed) = self.editor.as_mut()
+        {
+            ed.paper = paper;
+            ed.colour = colour;
+        }
     }
 
     /// Gives the open page its sheet, or takes it back to Auto, and writes it into the page's
@@ -6814,14 +6859,22 @@ impl NoteCraftApp {
             self.say(crate::tl_id!("ui.open_a_page_first"));
             return;
         };
+        if ed.locked {
+            self.say(crate::tl_id!("ui.page_is_read_only"));
+            return;
+        }
         if ed.paper_size == paper {
             return;
         }
         let was_size = ed.paper_size.map(|p| (std::mem::discriminant(&p.size), p.landscape));
-        ed.paper_size = paper;
         let path = path_str(&ed.dir);
         let line = paper.map_or_else(|| "auto".to_string(), notecraft_model::paper::Paper::write);
-        self.run("page.paper_size", &params(&[("path", &path), ("size", &line)]));
+        if self.run("page.paper_size", &params(&[("path", &path), ("size", &line)])).is_none() {
+            return;
+        }
+        if let Some(ed) = self.editor.as_mut() {
+            ed.paper_size = paper;
+        }
         // Said when the sheet or its turn changes, not at every step of a dragged margin.
         let now_size = paper.map(|p| (std::mem::discriminant(&p.size), p.landscape));
         if now_size != was_size || paper.is_none() {
@@ -6945,7 +6998,7 @@ impl NoteCraftApp {
         let shape = ed.history.here().is_some_and(|s| s.blocks.len() == ed.blocks.len());
         let kind = match (moving, shape, here, was) {
             (Some(press), ..) => crate::history::Kind::Moving(press),
-            (None, true, Some(a), Some(b)) if a == b && !edit => crate::history::Kind::Typing(a),
+            (None, true, Some(a), was) if !edit && was.is_none_or(|b| a == b) => crate::history::Kind::Typing(a),
             _ => crate::history::Kind::Edit,
         };
         let mut step = crate::history::Step::new(ed.body.clone(), ed.blocks.clone(), ed.boxes.clone(), ed.caret.clone(), kind);
@@ -7418,6 +7471,81 @@ impl NoteCraftApp {
             (true, true) => crate::tl_id!("ui.rotated_the_picture_ink_on_the_page_stays_where_it_is"),
             (false, true) => crate::tl_id!("ui.flipped_the_picture_ink_on_the_page_stays_where_it_is"),
         });
+    }
+
+    /// Copy Text from Picture (issue #274): reads the printed text of the picture `src`, or of every
+    /// page of the printout it is a page of, and opens the dialog that shows it for review.
+    fn copy_text_from_picture(&mut self, src: &str, whole_printout: bool) {
+        let Some(ed) = self.editor.as_ref() else {
+            self.say(crate::tl_id!("ui.open_a_page_first"));
+            return;
+        };
+        let printout = crate::picture_text::printout_source(src).filter(|_| whole_printout);
+        let sources: Vec<String> = match printout {
+            // Every page of the printout, in the order the page shows them.
+            Some(source) => {
+                let mut pages: Vec<String> = Vec::new();
+                for block in &ed.blocks {
+                    if let notecraft_formats::Block::Image { src: page, .. } = block
+                        && crate::picture_text::printout_source(page) == Some(source)
+                        && !pages.contains(page)
+                    {
+                        pages.push(page.clone());
+                    }
+                }
+                if pages.is_empty() { vec![src.to_string()] } else { pages }
+            }
+            None => vec![src.to_string()],
+        };
+        let mut pictures = Vec::with_capacity(sources.len());
+        for source in &sources {
+            match crate::preview::page_asset_path(&ed.dir, source) {
+                Some(path) => pictures.push(path),
+                None => {
+                    self.complain(&crate::i18n::format_message_id("ui.cannot_read_the_picture_error", &[("error", source)]));
+                    return;
+                }
+            }
+        }
+        let scope = match (printout.is_some(), crate::picture_text::printout_source(src).is_some()) {
+            (true, _) => crate::picture_text::Scope::Printout,
+            (false, true) => crate::picture_text::Scope::PrintoutPage,
+            (false, false) => crate::picture_text::Scope::Picture,
+        };
+        self.picture_text = Some(crate::picture_text::Dialog::start(scope, pictures, self.ocr_models()));
+    }
+
+    /// The folder with the text recognition models, when one is set.
+    fn ocr_models(&self) -> Option<PathBuf> {
+        self.session.settings.get("ocr_models").filter(|v| !v.trim().is_empty()).map(PathBuf::from)
+    }
+
+    /// Shows Copy Text from Picture while it is open, and does what it asks.
+    fn picture_text_dialog(&mut self, ctx: &Context) {
+        let Some(mut dialog) = self.picture_text.take() else { return };
+        self.give_modal_paste(ctx);
+        let out = dialog.show(ctx, &self.tokens);
+        if let Some(text) = out.copy {
+            match self.clipboard.set_text(&text) {
+                Ok(()) => dialog.mark_copied(),
+                Err(e) => self.complain(&crate::i18n::format_message_id("ui.picture_text_copy_failed", &[("error", &e)])),
+            }
+        }
+        if out.choose_models
+            && let Some(folder) = pick_ocr_models_folder()
+        {
+            if crate::picture_text::models_folder_is_complete(&folder) {
+                if let Err(e) = self.session.settings.set("ocr_models", &folder.to_string_lossy()) {
+                    self.complain(&e.to_string());
+                }
+                dialog = crate::picture_text::Dialog::start(dialog.scope(), dialog.pictures().to_vec(), Some(folder));
+            } else {
+                self.complain(crate::tl_id!("ui.picture_text_models_folder_incomplete"));
+            }
+        }
+        if !out.closed {
+            self.picture_text = Some(dialog);
+        }
     }
 
     fn save_picture_as(&mut self, src: &str) {
@@ -8520,6 +8648,46 @@ impl NoteCraftApp {
             || input.raw.events.iter().any(event_hit)
     }
 
+    /// Whether one of the dialogs drawn outside `self.dialog` is open: Copy Text from Picture. It
+    /// owns the keyboard as `self.dialog` does, so the page's shortcuts and paste wait.
+    fn own_modal_open(&self) -> bool {
+        self.picture_text.is_some()
+    }
+
+    /// Ctrl+V while such a dialog is open: the clipboard's text goes to the dialog's text box when
+    /// it has the keyboard, and nowhere otherwise.
+    ///
+    /// The page is drawn before the dialog and takes a paste for itself, so the paste is held here,
+    /// out of the frame's events, and handed to the dialog just before it is drawn
+    /// ([`Self::give_modal_paste`]).
+    fn paste_into_modal(&mut self, ctx: &egui::Context, queued: bool) {
+        let mut pasted: Option<String> = None;
+        ctx.input_mut(|input| {
+            input.events.retain(|event| match event {
+                egui::Event::Paste(text) => {
+                    pasted.get_or_insert_with(|| text.clone());
+                    false
+                }
+                egui::Event::PasteImage(_) => false,
+                _ => true,
+            });
+        });
+        if ctx.memory(|memory| memory.focused().is_none()) {
+            return;
+        }
+        if pasted.is_none() && (queued || ctx.input(|input| Self::clipboard_key_hit(input, Key::V))) {
+            pasted = self.clipboard.text();
+        }
+        self.modal_paste = pasted;
+    }
+
+    /// Hands a paste held by [`Self::paste_into_modal`] to the dialog about to be drawn.
+    fn give_modal_paste(&mut self, ctx: &egui::Context) {
+        if let Some(text) = self.modal_paste.take() {
+            ctx.input_mut(|input| input.events.push(egui::Event::Paste(text)));
+        }
+    }
+
     fn paste_into_emoji_search(&mut self, ctx: &egui::Context, queued: bool) {
         // The desktop shell catches native paste before egui for images/rich page
         // content. The picker only needs plain text. A native Paste event, where
@@ -8879,6 +9047,20 @@ impl NoteCraftApp {
         }
     }
 
+    /// A selected notebook (even with no pages) owns its own recovery action. When
+    /// there is no selection, only a single open notebook is unambiguous.
+    fn recycle_notebook(&self) -> Option<&Path> {
+        let tree = self.session.tree();
+        [self.selected.as_deref(), self.current_page()]
+            .into_iter()
+            .flatten()
+            .find_map(|p| tree.iter().find(|n| p.starts_with(&n.path)).map(|n| n.path.as_path()))
+            .or(match tree {
+                [n] => Some(n.path.as_path()),
+                _ => None,
+            })
+    }
+
     /// Opens (or refreshes in place) the notebook's recycle bin with `selected` chosen, or the
     /// newest item when that one is gone.
     fn open_recycle_bin(&mut self, notebook: PathBuf, selected: Option<String>) {
@@ -8933,6 +9115,9 @@ impl NoteCraftApp {
             Some(crate::preview::PictureHighlight { page_dir: path.to_path_buf(), src: format!("assets/{name}"), pixels, boxes: hit.boxes.clone() })
         });
         crate::preview::set_picture_highlight(ctx, highlight);
+        if self.backstage.is_some() {
+            self.close_backstage();
+        }
         self.expand_to(path);
         self.open_page_soon(path);
     }
@@ -9078,13 +9263,7 @@ impl NoteCraftApp {
     /// Looks again for the tagged notes in the Tags Summary's scope.
     fn refresh_tags(&mut self) {
         let Some(pane) = self.tags_pane.as_ref() else { return };
-        let page = self.editor.as_ref().map(|ed| ed.dir.clone());
-        let scope = match pane.scope {
-            TagScope::Page => page.clone(),
-            TagScope::Section => page.as_deref().and_then(section_for),
-            TagScope::Notebook => page.as_deref().and_then(notebook_for),
-            TagScope::All => None,
-        };
+        let scope = pane.scope.path(self.current_page());
         let mut p: Vec<(&str, String)> = Vec::new();
         if let Some(scope) = scope {
             p.push(("scope", path_str(&scope)));
@@ -9424,7 +9603,7 @@ impl NoteCraftApp {
             });
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button(crate::tl_id!("ui.new_notebook")).clicked() {
-                    self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None });
+                    self.dialog = Some(Dialog::NewNotebook { name: String::new(), format: None, first: true });
                 }
                 if ui.small_button(crate::tl_id!("ui.expand_all")).on_hover_text(crate::tl_id!("ui.open_every_level")).clicked() {
                     self.open = self.collect_branches().into_iter().collect();
@@ -10142,15 +10321,26 @@ impl NoteCraftApp {
                     // sheet is drawn behind it; an Auto page is the usual column (issue #269).
                     let sheet = ed.paper_size.filter(|_| wide).map(|p| crate::paper::Sheet::of(p, zoom_scale));
                     let page_column = sheet.map_or(780.0 * zoom_scale, crate::paper::Sheet::column);
-                    let margin = if wide { ((available_width - page_column) / 2.0).max(8.0) } else { 0.0 };
-                    let top_pad = sheet.map_or(4, |s| s.margins[0].round().clamp(4.0, 127.0) as i8);
+                    let margin = if let Some(sheet) = sheet.filter(|s| s.size.x <= available_width) {
+                        (available_width - sheet.size.x) / 2.0 + sheet.margins[3]
+                    } else if wide {
+                        ((available_width - page_column) / 2.0).max(8.0)
+                    } else {
+                        0.0
+                    };
+                    let top_pad = sheet.map_or(4.0, |s| s.margins[0].max(4.0));
+                    let content = ui.max_rect();
+                    // egui's Frame margins are i8. Use a float layout rect so a small
+                    // sheet stays centered in a wide window and shares its text origin.
+                    let body_min = content.min + vec2(margin, top_pad);
+                    let column = if available_width >= page_column { page_column } else { (available_width - 16.0).max(1.0) };
+                    let body_rect = egui::Rect::from_min_max(body_min, egui::pos2(body_min.x + column, (content.max.y - 8.0).max(body_min.y)));
                     if let Some(sheet) = sheet {
-                        let left = ui.max_rect().min.x + f32::from(margin as i8) - sheet.margins[3];
-                        let top = ui.max_rect().min.y + f32::from(top_pad) - sheet.margins[0];
+                        let left = body_rect.min.x - sheet.margins[3];
+                        let top = body_rect.min.y - sheet.margins[0];
                         crate::paper::paint(&ui.painter().with_clip_rect(viewport), viewport, egui::pos2(left, top), sheet, &tokens);
                     }
-                    egui::Frame::NONE.inner_margin(egui::Margin { left: margin as i8, right: margin as i8, top: top_pad, bottom: 8 }).show(ui, |ui| {
-                        let column = if available_width >= page_column { page_column } else { (available_width - 16.0).max(1.0) };
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
                         ui.set_min_width(column);
                         ui.set_width(column);
                         // The page's own name, at the top of the sheet. Before the sheet's
@@ -10414,7 +10604,7 @@ impl NoteCraftApp {
                             if moved.changed.link.is_some() {
                                 *follow = moved.changed.link;
                             }
-                        } else if wide {
+                        } else if wide || ed.locked {
                             // A page with markup the block model cannot hold: writing it back
                             // would drop that markup, so it is read here and changed in its
                             // source. See docs/gaps.md.
@@ -10425,7 +10615,11 @@ impl NoteCraftApp {
                             crate::pagemenu::show(ui, ui.clip_rect(), &mut page_acts, &tokens, ed.locked);
                             ui.add_space(14.0);
                             ui.label(
-                                egui::RichText::new(crate::tl_id!("ui.this_page_holds_markup_notecraft_does_not_edit_yet_s_bc3b3b6a92"))
+                                egui::RichText::new(if ed.locked {
+                                    crate::tl_id!("ui.page_is_read_only")
+                                } else {
+                                    crate::tl_id!("ui.this_page_holds_markup_notecraft_does_not_edit_yet_s_bc3b3b6a92")
+                                })
                                     .small()
                                     .color(tokens.muted),
                             );
@@ -10830,6 +11024,7 @@ impl NoteCraftApp {
         {
             self.reader = None;
         }
+        self.picture_text_dialog(ctx);
         if let Some(mut dialog) = self.custom_tags.take() {
             let out = dialog.show(ctx, &self.tokens);
             if let Some(list) = out.changed {
@@ -10920,6 +11115,13 @@ impl NoteCraftApp {
                     _ => crate::tl_id!("ui.welcome_wizard_done_title"),
                 }
                 .to_string();
+                // The wizard is 520 points wide where there is room. On a phone it takes the
+                // screen's width, less its frame and a margin, and the banner shrinks with it,
+                // so the banner and the buttons stay on screen (issue #477).
+                let screen = ctx.content_rect();
+                let width = (screen.width() - WIZARD_SCREEN_MARGIN).clamp(1.0, 520.0);
+                let banner_width = width.min(480.0);
+                let body_height = (screen.height() - WIZARD_SCREEN_MARGIN - WIZARD_BUTTON_ROW).max(80.0);
                 egui::Window::new(title.as_str())
                     .title_bar(false)
                     .collapsible(false)
@@ -10927,55 +11129,59 @@ impl NoteCraftApp {
                     .order(egui::Order::Foreground)
                     .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                     .frame(modal_frame(&self.tokens))
+                    .max_width(width)
                     .show(ctx, |ui| {
                         stay_above(ui, backdrop);
-                        ui.set_min_width(520.0);
-                        if *step == 0 {
-                            ui.add(egui::Image::from_bytes(banner_uri, banner_bytes).fit_to_exact_size(vec2(480.0, 240.0)));
-                            ui.add_space(8.0);
-                        }
-                        modal_title(ui, &self.tokens, title.as_str());
-                        match *step {
-                            0 => {}
-                            1 => {
-                                ui.label(crate::tl_id!("ui.privacy_is_our_top_priority_all_logs_and_telemetry_s_d87cae4eac"));
-                                ui.add_space(6.0);
-                                ui.label(crate::tl_id!("ui.choose_a_local_collection_level_logging_is_off_by_de_5dfbe386e0"));
-                                egui::ComboBox::from_label(crate::tl_id!("ui.local_collection_level"))
-                                    .selected_text(crate::tl!(level.as_str()))
-                                    .show_ui(ui, |ui| {
-                                        for choice in ["none", "usage", "warning", "error", "debug"] {
-                                            ui.selectable_value(level, choice.into(), crate::tl!(choice));
-                                        }
-                                    });
-                            }
-                            2 => {
-                                ui.label(crate::tl_id!("ui.welcome_format_body"));
+                        ui.set_min_width(width);
+                        ui.set_max_width(width);
+                        egui::ScrollArea::vertical().max_height(body_height).auto_shrink([false, true]).show(ui, |ui| {
+                            if *step == 0 {
+                                ui.add(egui::Image::from_bytes(banner_uri, banner_bytes).fit_to_exact_size(vec2(banner_width, banner_width / 2.0)));
                                 ui.add_space(8.0);
-                                for choice in PageFormat::ALL {
-                                    ui.radio_value(&mut *format, choice, choice.label());
+                            }
+                            modal_title(ui, &self.tokens, title.as_str());
+                            match *step {
+                                0 => {}
+                                1 => {
+                                    ui.label(crate::tl_id!("ui.privacy_is_our_top_priority_all_logs_and_telemetry_s_d87cae4eac"));
+                                    ui.add_space(6.0);
+                                    ui.label(crate::tl_id!("ui.choose_a_local_collection_level_logging_is_off_by_de_5dfbe386e0"));
+                                    egui::ComboBox::from_label(crate::tl_id!("ui.local_collection_level"))
+                                        .selected_text(crate::tl!(level.as_str()))
+                                        .show_ui(ui, |ui| {
+                                            for choice in ["none", "usage", "warning", "error", "debug"] {
+                                                ui.selectable_value(level, choice.into(), crate::tl!(choice));
+                                            }
+                                        });
+                                }
+                                2 => {
+                                    ui.label(crate::tl_id!("ui.welcome_format_body"));
+                                    ui.add_space(8.0);
+                                    for choice in PageFormat::ALL {
+                                        ui.radio_value(&mut *format, choice, choice.label());
+                                    }
+                                }
+                                3 => {
+                                    ui.label(crate::tl_id!("ui.welcome_notebook_prompt_body"));
+                                    ui.label(crate::i18n::format_message_id("ui.welcome_notebook_prompt_format", &[("format", format.label())]));
+                                    ui.add_space(6.0);
+                                    ui.colored_label(self.tokens.warn, crate::tl_id!("ui.welcome_notebook_replace_warning"));
+                                    ui.add_space(8.0);
+                                    ui.radio_value(&mut *add_demo, true, crate::tl_id!("ui.welcome_notebook_add_yes"));
+                                    ui.radio_value(&mut *add_demo, false, crate::tl_id!("ui.welcome_notebook_add_no"));
+                                }
+                                _ => {
+                                    ui.label(crate::tl_id!("ui.welcome_wizard_done_body"));
                                 }
                             }
-                            3 => {
-                                ui.label(crate::tl_id!("ui.welcome_notebook_prompt_body"));
-                                ui.label(crate::i18n::format_message_id("ui.welcome_notebook_prompt_format", &[("format", format.label())]));
-                                ui.add_space(6.0);
-                                ui.colored_label(self.tokens.warn, crate::tl_id!("ui.welcome_notebook_replace_warning"));
+                            if let Some(message) = error {
                                 ui.add_space(8.0);
-                                ui.radio_value(&mut *add_demo, true, crate::tl_id!("ui.welcome_notebook_add_yes"));
-                                ui.radio_value(&mut *add_demo, false, crate::tl_id!("ui.welcome_notebook_add_no"));
+                                ui.colored_label(
+                                    self.tokens.warn,
+                                    crate::i18n::format_message_id("ui.welcome_notebook_action_failed", &[("error", message)]),
+                                );
                             }
-                            _ => {
-                                ui.label(crate::tl_id!("ui.welcome_wizard_done_body"));
-                            }
-                        }
-                        if let Some(message) = error {
-                            ui.add_space(8.0);
-                            ui.colored_label(
-                                self.tokens.warn,
-                                crate::i18n::format_message_id("ui.welcome_notebook_action_failed", &[("error", message)]),
-                            );
-                        }
+                        });
                         ui.add_space(14.0);
                         ui.horizontal(|ui| {
                             if *step > 0 && modal_button(ui, &self.tokens, crate::tl_id!("ui.welcome_wizard_back"), false).clicked() {
@@ -11332,7 +11538,7 @@ impl NoteCraftApp {
                     }
                 }
             }
-            Dialog::NewNotebook { name, format } => {
+            Dialog::NewNotebook { name, format, first } => {
                 let mut go = false;
                 egui::Window::new(crate::tl_id!("ui.new_notebook"))
                     .title_bar(false)
@@ -11346,9 +11552,14 @@ impl NoteCraftApp {
                         ui.set_min_width(420.0);
                         ui.label(crate::tl_id!("ui.name_2"));
                         let r = ui.text_edit_singleline(name);
-                        // Read Enter before asking for focus again: a new focus request hides the lost focus.
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        r.request_focus();
+                        if *first {
+                            r.request_focus();
+                            *first = false;
+                        }
+                        if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+                            keep = false;
+                        }
                         format_picker(ui, format);
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
@@ -11945,8 +12156,14 @@ impl NoteCraftApp {
                                 log::info!("node deleted successfully: {:?}", path);
                                 if was_open {
                                     self.editor = None;
+                                    self.pad = None;
+                                    self.page_revision = None;
                                 }
-                                self.selected = None;
+                                // Retain the notebook and the nearest surviving organiser,
+                                // so History can recover even its last page or section.
+                                if was_open || self.selected.as_ref().is_some_and(|p| p.starts_with(&*path)) {
+                                    self.selected = path.parent().map(Path::to_path_buf);
+                                }
                                 self.say(crate::tl_id!("ui.moved_to_the_notebook_recycle_bin"));
                             }
                             None => {
@@ -12217,6 +12434,7 @@ impl NoteCraftApp {
                 }
             }
             Dialog::PageVersions { page, versions, preview } => {
+                let can_restore = notecraft_store::page::read_only(page).is_ok_and(|locked| !locked);
                 let mut restore: Option<String> = None;
                 let mut open: Option<(String, String)> = None;
                 let mut back = false;
@@ -12227,6 +12445,9 @@ impl NoteCraftApp {
                     .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                     .show(ctx, |ui| {
                         ui.set_min_width(420.0);
+                        if !can_restore {
+                            ui.colored_label(t.warn, crate::tl_id!("ui.page_is_read_only"));
+                        }
                         if let Some(p) = preview.as_mut() {
                             // An older version, read-only (issue #278): said in the window
                             // itself, so it is never taken for the page.
@@ -12246,7 +12467,9 @@ impl NoteCraftApp {
                             egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
                                 if p.comparing {
                                     let changed = p.changes.iter().any(|c| !matches!(c, crate::versions::Change::Same(_)));
-                                    if !changed {
+                                    if p.truncated {
+                                        ui.label(crate::tl_id!("ui.page_version_comparison_truncated"));
+                                    } else if !changed {
                                         ui.label(crate::tl_id!("ui.this_version_has_the_same_words_as_the_page"));
                                     }
                                     for change in &p.changes {
@@ -12271,7 +12494,7 @@ impl NoteCraftApp {
                             });
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                if modal_button(ui, &t, crate::tl_id!("ui.restore_this_version"), true).clicked() {
+                                if modal_button_enabled(ui, &t, crate::tl_id!("ui.restore_this_version"), true, can_restore).clicked() {
                                     restore = Some(p.id.clone());
                                 }
                                 if modal_button(ui, &t, crate::tl_id!("ui.back_to_the_list"), false).clicked() {
@@ -12300,7 +12523,7 @@ impl NoteCraftApp {
                                         if modal_button(ui, &t, crate::tl_id!("ui.preview"), true).clicked() {
                                             open = Some((version.id.clone(), version.created.clone()));
                                         }
-                                        if modal_button(ui, &t, crate::tl_id!("ui.restore"), false).clicked() {
+                                        if modal_button_enabled(ui, &t, crate::tl_id!("ui.restore"), false, can_restore).clicked() {
                                             restore = Some(version.id.clone());
                                         }
                                     });
@@ -12324,11 +12547,11 @@ impl NoteCraftApp {
                         Err(e) => self.complain(&crate::i18n::format_message_id("ui.cannot_open_that_version_error", &[("error", &e)])),
                     }
                 }
-                if let Some(id) = restore {
-                    if self.run("page.version.restore", &params(&[("path", &path_str(page)), ("id", &id)])).is_some() {
-                        self.open_page(page);
-                        self.say(crate::tl_id!("ui.restored_the_saved_page_version"));
-                    }
+                if let Some(id) = restore
+                    && self.run("page.version.restore", &params(&[("path", &path_str(page)), ("id", &id)])).is_some()
+                {
+                    self.open_page(page);
+                    self.say(crate::tl_id!("ui.restored_the_saved_page_version"));
                     keep = false;
                 }
             }
@@ -13203,6 +13426,14 @@ impl NoteCraftApp {
         // Pen pressure, where the platform reports it. Nothing draws with it yet; it is
         // read here so `ui.inspect` can say whether a pen reaches this window at all.
         ctx.input(|i| self.stylus.update(&i.events));
+        crate::ribbon::note_touches(ctx);
+        // A pen on a tablet mapped to a large screen moves further in a tap than a mouse does
+        // in a click: past the six points egui allows, a tap on a button did nothing. Once a pen
+        // has been seen, a click may move twice as far.
+        let click_dist = if self.stylus.sample().pen { PEN_CLICK_DIST } else { egui::InputOptions::default().max_click_dist };
+        if ctx.options(|o| o.input_options.max_click_dist) != click_dist {
+            ctx.options_mut(|o| o.input_options.max_click_dist = click_dist);
+        }
         // An update is ready to be put in place: save the page and close, so the script that
         // waits for this window can replace the program and start the new one.
         if !self.update_closing && self.update.lock().is_ok_and(|s| matches!(*s, crate::update::Status::Restart { .. })) {
@@ -13237,8 +13468,13 @@ impl NoteCraftApp {
             }
         }
         let queued_paste = std::mem::take(&mut self.keyboard_paste_requested);
+        // A dialog of the window's own (Copy Text from Picture) owns the keyboard: a paste goes into
+        // its text box, never into the page behind it.
+        let modal = self.own_modal_open();
         if emoji_picker_open {
             self.paste_into_emoji_search(ctx, queued_paste);
+        } else if modal {
+            self.paste_into_modal(ctx, queued_paste);
         } else if queued_paste {
             log::debug!("queued keyboard paste dispatched to paste_here");
             self.paste_here();
@@ -13248,7 +13484,7 @@ impl NoteCraftApp {
         if let Some(notice) = crate::filepicker::take_notice() {
             self.say(notice);
         }
-        if !emoji_picker_open {
+        if !emoji_picker_open && !modal {
             self.clipboard_keys(ctx);
         }
         self.poll_control(ctx);
@@ -13271,7 +13507,7 @@ impl NoteCraftApp {
         // Not while a dialog is open: it owns the keyboard, and the page behind it must not
         // change unseen (issue #262: Ctrl+Z undid and saved an edit behind Insert symbol). A
         // text box in the dialog keeps its own undo.
-        let page_keys = self.dialog.is_none() && !emoji_picker_open;
+        let page_keys = self.dialog.is_none() && !self.own_modal_open() && !emoji_picker_open && !ctx.memory(|memory| memory.has_focus(search_id));
         if page_keys && ctx.input_mut(|i| i.consume_key(ctrl_shift, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y)) {
             // The ink's as well as the page's, whichever Undo took back.
             self.redo();
@@ -13285,7 +13521,7 @@ impl NoteCraftApp {
         // something were written into the note (issue #134). The code view has a Find of its
         // own for the file it shows, so it keeps Ctrl+F while it is open.
         // OneNote's Ctrl+K: the Link dialog for the words picked or the link the caret is in.
-        if !self.show_source && self.dialog.is_none() && self.editor.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
+        if !self.show_source && page_keys && self.editor.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
             self.open_link_dialog();
         }
         if !self.show_source && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F) || i.consume_key(Modifiers::COMMAND, Key::E)) {
@@ -13315,6 +13551,7 @@ impl NoteCraftApp {
             self.title_band(ui, false);
             self.storage_notice(ui);
             self.backstage_screen(ui);
+            self.search_popup(ctx);
             self.dialogs(ctx);
             self.import_progress(ctx);
             self.frame_edges(ctx);
@@ -13588,6 +13825,18 @@ fn pick_calendar_file() -> Option<PathBuf> {
 
 #[cfg(target_arch = "wasm32")]
 fn pick_calendar_file() -> Option<PathBuf> {
+    None
+}
+
+/// Copy Text from Picture asks for the folder with the text recognition models (issue #274).
+/// Below the other choosers, and gated in its own right, for the same reason as the ones above.
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_ocr_models_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title(crate::tl_id!("ui.choose_the_ocr_models_folder")).pick_folder()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_ocr_models_folder() -> Option<PathBuf> {
     None
 }
 
@@ -15760,7 +16009,7 @@ mod page_open_tests {
         let pipe = sample.md_page.join("still-coming.bin");
         assert!(std::process::Command::new("mkfifo").arg(&pipe).status().expect("mkfifo").success());
         h.state_mut().open_page_soon(&sample.md_page);
-        h.state_mut().dialog = Some(Dialog::NewNotebook { name: String::new(), format: None });
+        h.state_mut().dialog = Some(Dialog::NewNotebook { name: String::new(), format: None, first: true });
         assert!(write_when_read(&pipe, b"in"), "the page's files were being read");
         for _ in 0..20 {
             h.step();
