@@ -3501,7 +3501,8 @@ fn a_page_version_can_be_previewed_and_compared_before_it_is_restored() {
         }
         h.get_by_label("Page Versions").click();
         settle(h);
-        h.get_by_label("Preview").click();
+        // Issue #382: selecting a saved version in the list is how it is looked at.
+        h.get_all_by_label_contains("Saved version, ").next().expect("the newest saved version").click();
         settle(h);
     };
     open_preview(&mut h);
@@ -3515,11 +3516,11 @@ fn a_page_version_can_be_previewed_and_compared_before_it_is_restored() {
     assert!(h.query_by_label(&format!("− {then_line}")).is_some(), "a line only in the version is marked −: {then_line}");
     review(&mut h, "page_version_compare");
 
-    // Back and Close leave everything as it was.
-    h.get_by_label("Back to the list").click();
+    // Back to the current page and Return to page leave everything as it was.
+    h.get_all_by_label_contains("Current page, ").next().expect("the current page row").click();
     settle(&mut h);
-    assert!(h.query_by_label("Saved copies of this page").is_some(), "back at the list");
-    h.get_by_label("Close").click();
+    assert!(h.query_by_label_contains("This is the page as it is now.").is_some(), "the current page is selected");
+    h.get_by_label("Return to page").click();
     settle(&mut h);
     assert_eq!(std::fs::read(&file).expect("read"), saved, "the page file is untouched");
 
@@ -3529,6 +3530,220 @@ fn a_page_version_can_be_previewed_and_compared_before_it_is_restored() {
     settle(&mut h);
     let now = h.state().body().unwrap_or_default().to_string();
     assert!(now.contains(&then_line) && !now.contains("bravo"), "restored: {now}");
+}
+
+/// Issue #382: Page Versions is one workspace. The current page and each saved version are rows
+/// with their times; selecting a version shows it beside the list without touching the page, the
+/// arrow keys move through the list, Compare keeps its mode as the selection moves, Escape and
+/// Return to page leave the page as it was, and Restore puts back the version selected. A narrow
+/// window stacks the list over the preview.
+#[test]
+fn page_versions_is_a_workspace_with_the_list_beside_the_preview() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-versions-workspace");
+    let page = s.md_page.clone();
+    notecraft_store::page::save_body(&page, "the page now\n").expect("save");
+    // Saved versions as the folder keeps them (`.notecraft/versions/<id>/`): the store keeps one
+    // every five minutes, too slow to wait for here.
+    for (n, (words, when)) in
+        [("first draft", "2026-11-20T09:00:00Z"), ("second draft", "2026-11-21T09:00:00Z"), ("third draft", "2026-11-22T09:00:00Z")]
+            .iter()
+            .enumerate()
+    {
+        let id = format!("{:016x}{:04x}", 0x1000 + n, n);
+        let entry = page.join(".notecraft").join("versions").join(&id);
+        std::fs::create_dir_all(&entry).expect("version folder");
+        std::fs::write(entry.join("index.md"), format!("---\ntitle: Version\n---\n\n{words}\n")).expect("version body");
+        std::fs::write(entry.join("version.toml"), format!("id = \"{id}\"\ncreated = \"{when}\"\n")).expect("version info");
+    }
+    let versions = notecraft_store::page::versions(&page).expect("versions");
+    assert!(versions.len() >= 3, "several saved versions: {}", versions.len());
+    let file = page.join("index.md");
+    let live = std::fs::read(&file).expect("page");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1400.0, 900.0));
+    h.state_mut().open_path(&page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("History").click();
+    settle(&mut h);
+    h.get_by_label("Page Versions").click();
+    settle(&mut h);
+    let rows: Vec<_> = h.query_all_by_label_contains("Saved version, ").map(|n| n.rect()).collect();
+    assert_eq!(rows.len(), versions.len(), "one row per saved version");
+    let current = h.get_all_by_label_contains("Current page, ").next().expect("the current page row");
+    assert_eq!(current.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True), "the current page is selected first");
+    let list_right = current.rect().max.x;
+    assert!(h.get_by_label("Restore this version").accesskit_node().is_disabled(), "nothing to restore with the page selected");
+    // Down selects the newest saved version and shows it beside the list.
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    let heading = h
+        .get_all_by_label_contains("Saved version, ")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::Label)
+        .expect("the preview's heading");
+    assert!(heading.rect().min.x > list_right, "the preview is beside the list");
+    assert!(!h.get_by_label("Restore this version").accesskit_node().is_disabled());
+    h.get_by_label("Compare with the page").click();
+    settle(&mut h);
+    assert!(h.query_by_label("+ the page now").is_some(), "the comparison shows the page's own line");
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    assert_eq!(is_on(&h, "Compare with the page"), Some(true), "the mode stays as the selection moves");
+    review(&mut h, "page_versions_workspace");
+    assert_eq!(std::fs::read(&file).expect("page"), live, "looking changes nothing");
+    h.key_press(egui::Key::ArrowUp);
+    h.key_press(egui::Key::ArrowUp);
+    settle(&mut h);
+    assert!(h.query_by_label_contains("This is the page as it is now.").is_some(), "Up goes back to the current page");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.query_by_label("Return to page").is_none(), "Escape leaves Page Versions");
+    assert_eq!(std::fs::read(&file).expect("page"), live, "and the page is as it was");
+
+    // Restore puts back the version selected, the second newest here.
+    h.get_by_label("Page Versions").click();
+    settle(&mut h);
+    let chosen = versions[1].clone();
+    let (_, chosen_body) = notecraft_store::page::version_body(&page, &chosen.id).expect("its body");
+    h.key_press(egui::Key::ArrowDown);
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    h.get_by_label("Restore this version").click();
+    settle(&mut h);
+    let restored = h.state().body().unwrap_or_default().to_string();
+    let words = chosen_body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default().to_string();
+    assert!(restored.contains(&words), "the selected version was restored: {restored} / {words}");
+
+    // A narrow window stacks the preview under the list.
+    let (_t2, app, s2) = sample_app("ui-versions-narrow");
+    notecraft_store::page::save_body(&s2.md_page, "a saved draft\n").expect("save");
+    let mut h = sized_harness(app, DARK, egui::vec2(700.0, 820.0));
+    h.state_mut().open_path(&s2.md_page.to_string_lossy());
+    settle(&mut h);
+    h.state_mut().open_page_versions();
+    settle(&mut h);
+    let at = h.get_all_by_label_contains("Saved version, ").next().expect("a version row").rect().center();
+    h.input_mut().events.push(egui::Event::PointerMoved(at));
+    h.step();
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    }
+    settle(&mut h);
+    let row =
+        h.get_all_by_label_contains("Saved version, ").find(|n| n.accesskit_node().role() == egui::accesskit::Role::Button).expect("row").rect();
+    // The heading wraps at this width, so it is found by its first words.
+    let heading =
+        h.get_all_by_label_contains("Saved version").find(|n| n.accesskit_node().role() == egui::accesskit::Role::Label).expect("heading").rect();
+    assert!(heading.min.y > row.max.y, "narrow: the preview is under the list");
+    review(&mut h, "page_versions_narrow");
+}
+
+/// Issue #382: History results tell two pages of one name apart by where they are and when they
+/// were changed, and the one chosen is the one opened.
+#[test]
+fn recent_edits_tell_two_pages_of_one_name_apart() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-recent-same-name");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1400.0, 900.0));
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    let sections: Vec<String> = [&s.html_page, &s.md_page].iter().map(|p| p.parent().expect("section").to_string_lossy().into_owned()).collect();
+    assert_ne!(sections[0], sections[1], "the sample's two pages are in two sections");
+    let mut made = Vec::new();
+    for section in &sections {
+        let page = ask(
+            &mut h,
+            "engine.execute",
+            json!({"command": "node.create", "params": {"parent": section, "kind": "page", "title": "Weekly plan", "format": "cmgfm"}}),
+        )
+        .expect("page");
+        made.push(std::path::PathBuf::from(page.as_str().expect("a path")));
+    }
+    settle(&mut h);
+    h.get_by_label("History").click();
+    settle(&mut h);
+    h.get_by_label("Recent Edits").click();
+    settle(&mut h);
+    let places: Vec<String> = made.iter().map(|p| notecraft_store::tree::read_node(p.parent().expect("section")).expect("section").title).collect();
+    let links: Vec<_> = h.query_all_by_role_and_label(egui::accesskit::Role::Link, "Weekly plan").map(|n| n.rect()).collect();
+    assert_eq!(links.len(), 2, "both pages are listed");
+    for place in &places {
+        assert!(h.query_all_by_label_contains(place).count() > 0, "the section {place} is named under its page");
+    }
+    // The second one, by the place written under it.
+    let detail_under = |h: &Harness<'_, NoteCraftApp>, link: egui::Rect| {
+        h.query_all_by_label_contains(" \u{b7} ")
+            .find(|n| (n.rect().min.y - link.max.y).abs() < 6.0)
+            .and_then(|n| n.accesskit_node().value().or_else(|| n.accesskit_node().label()))
+            .unwrap_or_default()
+    };
+    let link = links.iter().copied().find(|r| detail_under(&h, *r).contains(&places[1])).expect("the link with the second place under it");
+    h.query_all_by_role_and_label(egui::accesskit::Role::Link, "Weekly plan").find(|n| n.rect() == link).expect("link").click();
+    settle(&mut h);
+    // Compared as the folders they name: on Windows the engine's path and the tree's can be spelt
+    // differently for the same folder.
+    let same = |a: &std::path::Path, b: &std::path::Path| std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok();
+    let open = h.state().current_page().map(std::path::Path::to_path_buf).expect("a page is open");
+    assert!(same(&open, &made[1]), "the page in {} is the one opened: {open:?}, not {:?}", places[1], made[0]);
+    assert!(!same(&open, &made[0]));
+}
+
+/// Issue #382: a version picked with the keys far down a long list is scrolled into sight.
+#[test]
+fn page_versions_scrolls_a_version_picked_with_the_keys_into_sight() {
+    let (_t, app, s) = sample_app("ui-versions-scroll");
+    let page = s.md_page.clone();
+    for n in 0..24u32 {
+        let id = format!("{:016x}{:04x}", 0x2000 + n, n);
+        let entry = page.join(".notecraft").join("versions").join(&id);
+        std::fs::create_dir_all(&entry).expect("version folder");
+        std::fs::write(entry.join("index.md"), format!("---\ntitle: Version\n---\n\nDraft {n}\n")).expect("version body");
+        std::fs::write(entry.join("version.toml"), format!("id = \"{id}\"\ncreated = \"2026-10-{:02}T09:00:00Z\"\n", n + 1)).expect("version info");
+    }
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1200.0, 640.0));
+    h.state_mut().open_path(&page.to_string_lossy());
+    settle(&mut h);
+    h.state_mut().open_page_versions();
+    settle(&mut h);
+    let restore = h.get_by_label("Restore this version").rect();
+    for _ in 0..20 {
+        h.key_press(egui::Key::ArrowDown);
+        h.step();
+    }
+    settle(&mut h);
+    let selected = h
+        .query_all_by_label_contains("Saved version, ")
+        .find(|n| {
+            use egui_kittest::kittest::NodeT as _;
+            n.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+        })
+        .expect("the selected row")
+        .rect();
+    assert!(selected.max.y <= restore.min.y, "the 20th version's row is in sight above the buttons: {selected:?} / {restore:?}");
+}
+
+/// Issue #382: a page with no saved versions says so, and offers only its current page.
+#[test]
+fn page_versions_with_no_saved_versions_says_so() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-versions-none");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1400.0, 900.0));
+    let page = s.html_page.clone();
+    h.state_mut().open_path(&page.to_string_lossy());
+    settle(&mut h);
+    if notecraft_store::page::versions(&page).expect("versions").is_empty() {
+        h.state_mut().open_page_versions();
+        settle(&mut h);
+        assert_eq!(h.query_all_by_label_contains("Saved version, ").count(), 0);
+        assert!(h.query_all_by_label_contains("Current page, ").count() == 1);
+        assert!(h.query_by_label_contains("No saved versions yet").is_some());
+        assert!(h.get_by_label("Restore this version").accesskit_node().is_disabled());
+    }
 }
 
 /// Issue #269: View > Paper Size gives a page a sheet, turned either way and with its own
@@ -8026,6 +8241,74 @@ fn a_picture_in_a_shared_box_is_moved_by_dragging_it() {
             assert_eq!(reopened, original, "the same blocks after reopening in {what}");
         }
     }
+}
+
+// ---------- File > Print (issue #168) ----------
+
+/// Waits until the Print dialog has laid out its sheets.
+fn wait_for_sheets(h: &mut Harness<'_, NoteCraftApp>) {
+    for _ in 0..200 {
+        settle(h);
+        if h.query_all(egui_kittest::kittest::by().label_contains("Sheet 1 of")).next().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("the sheets were never laid out");
+}
+
+#[test]
+fn ctrl_p_previews_the_page_and_saves_it_as_a_pdf_of_its_sheets() {
+    let (_t, mut app, s) = sample_app("ui-print");
+    app.enable_file_downloads();
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::P);
+    wait_for_sheets(&mut h);
+    review(&mut h, "print-dialog");
+    assert!(h.state().printing(), "Ctrl+P opens the Print dialog");
+    assert!(h.query_by_label("Print preview").is_some(), "the first sheet is shown");
+    let sheets = (1..50).find(|n| h.query_by_label(&format!("Sheet 1 of {n}")).is_some()).expect("the sheets are counted");
+    assert!(sheets >= 1);
+
+    h.get_by_label("Save as PDF").click();
+    settle(&mut h);
+    let downloads = h.state_mut().take_file_downloads();
+    assert_eq!(downloads.len(), 1, "one PDF");
+    assert_eq!(downloads[0].mime, "application/pdf");
+    assert!(downloads[0].name.ends_with(".pdf"), "{}", downloads[0].name);
+    let pdf = String::from_utf8_lossy(&downloads[0].bytes);
+    assert!(pdf.starts_with("%PDF-"));
+    assert!(pdf.contains(&format!("/Count {sheets}")), "a PDF page for every sheet");
+    // A4 unless the page has a paper of its own.
+    assert!(pdf.contains("/MediaBox [0 0 595.28 841.89]"), "the sheets are A4");
+
+    // Landscape turns the sheets, and the preview is laid out again.
+    h.get_by_label("Landscape").click();
+    wait_for_sheets(&mut h);
+    h.get_by_label("Save as PDF").click();
+    settle(&mut h);
+    let downloads = h.state_mut().take_file_downloads();
+    assert!(String::from_utf8_lossy(&downloads[0].bytes).contains("/MediaBox [0 0 841.89 595.28]"), "landscape sheets");
+
+    h.get_by_label("Close").click();
+    settle(&mut h);
+    assert!(!h.state().printing(), "Close closes it");
+}
+
+#[test]
+fn file_print_is_built_and_opens_the_print_dialog() {
+    let (_t, app, s) = sample_app("ui-print-file");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("File").click();
+    settle(&mut h);
+    h.get_by_label("Print").click();
+    settle(&mut h);
+    assert!(h.state().printing(), "File > Print opens the Print dialog");
+    assert!(h.query_by_label("This page").is_some() && h.query_by_label("Every page of this section").is_some(), "with a choice of what to print");
 }
 
 // ---------- Copy Text from Picture (issue #274) ----------
@@ -14041,6 +14324,92 @@ fn window_capture_clean_view_reloads_changes_and_missing_pages_keep_unsaved_inpu
     assert!(second.is_dirty());
 }
 
+/// A second view of a page whose words, and ink or title, were edited when the page was changed
+/// on disk. Returns it in a harness, with the page in conflict. The edited title still has the
+/// keyboard, so it is not saved yet.
+fn conflicted_second_view(name: &str, ink: bool, title: bool) -> (TempDir, Harness<'static, NoteCraftApp>, Sample) {
+    let (t, mut first, sample) = sample_app(name);
+    let page = sample.html_page.clone();
+    first.open_path(&page.to_string_lossy());
+    let second = first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false }).expect("second");
+    drop(first);
+    let mut h = sized_harness(second, LIGHT, egui::vec2(1500.0, 900.0));
+    settle(&mut h);
+    h.state_mut().set_body("<p>second view words</p>");
+    if title {
+        h.get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Title").click();
+        pump(&mut h);
+        ask(&mut h, "ui.key", json!({"key":"A", "ctrl":true})).expect("select title");
+        pump(&mut h);
+        ask(&mut h, "ui.text", json!({"text":"Title edited in the second view"})).expect("title text");
+        pump(&mut h);
+    }
+    if ink {
+        h.get_by_label("Draw").click();
+        h.run();
+        h.get_by_label("Pen red").click();
+        h.run();
+        let body = h.state().page_rect().expect("the page is on the screen");
+        let y = body.min.y + 160.0;
+        ask(&mut h, "ui.press", json!({"x": body.min.x + 40.0, "y": y})).expect("down");
+        pump(&mut h);
+        for step in 1..=6 {
+            ask(&mut h, "ui.move", json!({"x": body.min.x + 40.0 + step as f32 * 30.0, "y": y})).expect("move");
+            pump(&mut h);
+        }
+        ask(&mut h, "ui.release", json!({"x": body.min.x + 220.0, "y": y})).expect("up");
+        pump(&mut h);
+    }
+    notecraft_store::page::save_body(&page, "<p>words saved elsewhere</p>").expect("a change from elsewhere");
+    h.state_mut().save();
+    assert!(h.state().has_page_conflict());
+    assert!(h.state().is_dirty());
+    assert!(!page.join("ink.svg").exists(), "the second view's ink is not written over the newer page");
+    (t, h, sample)
+}
+
+#[test]
+fn keep_a_copy_opens_the_copy_with_its_ink_and_title_and_leaves_the_page_alone() {
+    // #497: the unsaved ink (or title) left the view marked unsaved, so the copy was made but
+    // never opened, and change checks stopped.
+    for (ink, title) in [(true, false), (false, true)] {
+        let (_t, mut h, sample) = conflicted_second_view("window-keep-copy-opens", ink, title);
+        let page = sample.html_page;
+        let copy = h.state_mut().keep_conflicted_copy().expect("keep copy");
+        assert_ne!(copy, page);
+        assert_eq!(h.state().current_page(), Some(copy.as_path()), "the copy is the page shown (ink {ink}, title {title})");
+        assert!(!h.state().has_page_conflict());
+        assert!(!h.state().is_dirty());
+        assert!(notecraft_store::page::load_page(&copy).expect("copy").body.contains("second view words"));
+        if ink {
+            assert!(copy.join("ink.svg").exists(), "the ink went with the copy");
+        }
+        if title {
+            assert_eq!(notecraft_store::tree::read_node(&copy).expect("copy").title, "Title edited in the second view");
+        }
+        for _ in 0..10 {
+            settle(&mut h);
+        }
+        assert!(!page.join("ink.svg").exists(), "nothing of the second view is written into the original later");
+        assert_eq!(notecraft_store::page::load_page(&page).expect("original").body, "<p>words saved elsewhere</p>");
+        assert_ne!(notecraft_store::tree::read_node(&page).expect("original").title, "Title edited in the second view");
+    }
+}
+
+#[test]
+fn reload_after_a_conflict_drops_an_edited_title_and_lets_the_page_be_left() {
+    // #496: the edited title kept the reloaded page dirty, so it could not be left.
+    let (_t, mut h, sample) = conflicted_second_view("window-reload-title", false, true);
+    let page = sample.html_page;
+    assert!(h.state_mut().reload_conflicted_page());
+    assert!(!h.state().has_page_conflict());
+    assert!(!h.state().is_dirty(), "the reloaded page has nothing unsaved");
+    assert!(h.state().body().expect("reloaded").contains("words saved elsewhere"));
+    assert_ne!(notecraft_store::tree::read_node(&page).expect("page").title, "Title edited in the second view");
+    ask(&mut h, "ui.open", json!({"path": sample.md_page.to_string_lossy()})).expect("open another page");
+    assert_eq!(h.state().current_page(), Some(sample.md_page.as_path()), "the page can be left");
+}
+
 #[test]
 fn window_capture_refreshed_caret_uses_the_new_pages_formatting() {
     for html in [false, true] {
@@ -14838,6 +15207,490 @@ fn view_toggles_show_their_state_and_reset_zoom_resets() {
     h.get_by_label("Tabs layout").click();
     settle(&mut h);
     assert_eq!(is_on(&h, "Tabs layout"), Some(true));
+}
+
+/// Issue #376: View > Page Setup names each part of the paper with what it is set to, and each
+/// row changes it: page colour, rule lines and paper size.
+#[test]
+fn view_page_setup_rows_show_and_change_their_values() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-view-paper-values");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1800.0, 800.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("View").click();
+    settle(&mut h);
+    let value = |h: &Harness<'_, NoteCraftApp>, label: &str| h.get_by_label(label).accesskit_node().value();
+    assert_eq!(value(&h, "Page colour").as_deref(), Some("No colour"));
+    assert_eq!(value(&h, "Rule lines").as_deref(), Some("None"));
+    assert_eq!(value(&h, "Paper size").as_deref(), Some("Auto"));
+    h.get_by_label("Page colour").click();
+    settle(&mut h);
+    h.get_all_by_label("Blue").last().expect("the blue swatch").click();
+    settle(&mut h);
+    assert_eq!(value(&h, "Page colour").as_deref(), Some("Blue"));
+    h.get_by_label("Rule lines").click();
+    settle(&mut h);
+    h.get_all_by_label("College ruled").last().expect("college ruled paper").click();
+    settle(&mut h);
+    assert_eq!(value(&h, "Rule lines").as_deref(), Some("College ruled"));
+    h.get_by_label("Paper size").click();
+    settle(&mut h);
+    h.get_by_label("A5").click();
+    settle(&mut h);
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(value(&h, "Paper size").as_deref(), Some("A5, Portrait"));
+    review(&mut h, "view_page_setup_values");
+    let text = std::fs::read_to_string(s.md_page.join("index.md")).expect("page");
+    assert!(text.contains("blue") && text.contains("college") && text.contains("a5"), "the page keeps what was picked: {text}");
+}
+
+/// Issue #376: zoom is one cluster that keeps its percentage in step with the page, from the
+/// ribbon, the list of sizes and the keyboard (Ctrl+Alt with plus, minus or 0), and F11 gives the
+/// page the whole window and takes it back.
+#[test]
+fn view_zoom_cluster_and_full_page_follow_the_page() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-view-zoom-cluster");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1800.0, 800.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("View").click();
+    settle(&mut h);
+    let shown = |h: &Harness<'_, NoteCraftApp>| h.get_by_label("Zoom level").accesskit_node().value();
+    assert_eq!(shown(&h).as_deref(), Some("100%"));
+    // Zoom Out, the percentage and Zoom In read left to right, in that order.
+    let x = |h: &Harness<'_, NoteCraftApp>, label: &str| h.get_by_label(label).rect().center().x;
+    assert!(x(&h, "Zoom Out") < x(&h, "Zoom level") && x(&h, "Zoom level") < x(&h, "Zoom In"), "Zoom Out, the zoom now, Zoom In");
+    h.get_by_label("Zoom In").click();
+    settle(&mut h);
+    assert_eq!((h.state().zoom_percent(), shown(&h).as_deref()), (110, Some("110%")));
+    h.get_by_label("Zoom level").click();
+    settle(&mut h);
+    h.get_by_label("150%").click();
+    settle(&mut h);
+    assert_eq!((h.state().zoom_percent(), shown(&h).as_deref()), (150, Some("150%")));
+    let keys = egui::Modifiers::COMMAND | egui::Modifiers::ALT;
+    h.key_press_modifiers(keys, egui::Key::Minus);
+    settle(&mut h);
+    assert_eq!((h.state().zoom_percent(), shown(&h).as_deref()), (140, Some("140%")), "Ctrl+Alt+- zooms the page out");
+    h.key_press_modifiers(keys, egui::Key::Equals);
+    settle(&mut h);
+    assert_eq!(h.state().zoom_percent(), 150, "Ctrl+Alt+= zooms it in");
+    h.key_press_modifiers(keys, egui::Key::Num0);
+    settle(&mut h);
+    assert_eq!((h.state().zoom_percent(), shown(&h).as_deref()), (100, Some("100%")), "Ctrl+Alt+0 is Reset zoom");
+    // Page Width fits the page, and Reset zoom goes back to 100% from it.
+    h.get_by_label("Page Width").click();
+    settle(&mut h);
+    let fitted = h.state().zoom_percent();
+    let after_fit = shown(&h);
+    assert_eq!(after_fit, Some(format!("{fitted}%")), "the box shows the fitted zoom");
+    // F11 takes the notebooks away and brings them back; the button says which.
+    assert_eq!(is_on(&h, "Full Page View"), Some(false));
+    h.key_press(egui::Key::F11);
+    settle(&mut h);
+    assert!(h.state().is_full_page(), "F11 gives the page the whole window");
+    assert_eq!(is_on(&h, "Full Page View"), Some(true));
+    h.key_press(egui::Key::F11);
+    settle(&mut h);
+    assert!(!h.state().is_full_page(), "and F11 brings the notebooks back");
+    h.get_by_label("Full Page View").click();
+    settle(&mut h);
+    assert!(h.state().is_full_page(), "the button does the same");
+    h.get_by_label("Normal view").click();
+    settle(&mut h);
+    assert!(!h.state().is_full_page());
+}
+
+/// Issue #376: at a narrow width, in the long pseudo-locale, the paper and zoom controls can still
+/// be reached with Tab and opened with Enter, even where the ribbon has to scroll to show them.
+#[test]
+fn view_paper_and_zoom_are_reachable_by_keyboard_when_narrow_and_long() {
+    use egui_kittest::kittest::NodeT as _;
+    let t = TempDir::new("ui-view-keyboard-narrow");
+    let mut s = session(&t);
+    s.settings.set("ui_language", "en-XA").expect("pseudo-locale");
+    let sample = create_sample(&mut s, Some(LOGO_PNG)).expect("sample");
+    let mut h = sized_harness(NoteCraftApp::new(s), LIGHT, egui::vec2(1000.0, 820.0));
+    h.state_mut().open_path(&sample.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("$$$View@@@").click();
+    settle(&mut h);
+    let focused = |h: &Harness<'_, NoteCraftApp>| h.query_by(|n| n.is_focused()).and_then(|n| n.accesskit_node().label());
+    for target in ["$$$Paper size@@@", "$$$Zoom level@@@"] {
+        h.get_by_label_contains("Normal").focus();
+        settle(&mut h);
+        let mut reached = false;
+        for _ in 0..80 {
+            h.key_press(egui::Key::Tab);
+            h.step();
+            if focused(&h).as_deref() == Some(target) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "{target} is reached with Tab");
+        h.key_press(egui::Key::Enter);
+        settle(&mut h);
+        let opened = if target.contains("Paper") { "A5" } else { "150%" };
+        assert!(h.query_all_by_label_contains(opened).count() > 0, "Enter on {target} opens its choices");
+        h.key_press(egui::Key::Escape);
+        settle(&mut h);
+    }
+}
+
+/// Issue #376: Page Setup shows the paper the page is drawn on, its own when it has one; and the
+/// page's zoom keys leave the page alone while Customize Tags is open over it.
+#[test]
+fn view_shows_a_page_s_own_paper_and_its_keys_wait_for_customize_tags() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-view-own-paper");
+    notecraft_store::page::set_appearance(&s.md_page, Some("college"), None).expect("the page's own paper");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1800.0, 800.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("View").click();
+    settle(&mut h);
+    assert_eq!(h.get_by_label("Rule lines").accesskit_node().value().as_deref(), Some("College ruled"), "the page's own paper is the one named");
+    h.get_by_label("Home").click();
+    settle(&mut h);
+    h.get_by_label("More tags").click();
+    h.run_steps(2);
+    h.get_by_label("Customize Tags...").click();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::ALT, egui::Key::Equals);
+    h.key_press(egui::Key::F11);
+    settle(&mut h);
+    assert_eq!(h.state().zoom_percent(), 100, "no zoom behind the dialog");
+    assert!(!h.state().is_full_page(), "and no Full Page View");
+}
+
+/// Issues #372 and #376: on every tab, at a laptop width and a wide one, no control runs into the
+/// name of its group under it (View's Paper size used to sit on "Page Setup").
+#[test]
+fn no_ribbon_control_runs_into_its_group_name() {
+    use egui_kittest::kittest::NodeT as _;
+    let anchors = [("Home", "Clipboard"), ("Insert", "Tables"), ("Draw", "Selection"), ("History", "Unread"), ("View", "Views")];
+    for width in [1100.0, 1600.0, 2200.0] {
+        let (_t, app, s) = sample_app("ui-ribbon-captions");
+        let mut h = sized_harness(app, LIGHT, egui::vec2(width, 820.0));
+        h.state_mut().open_path(&s.md_page.to_string_lossy());
+        settle(&mut h);
+        for (tab, group) in anchors {
+            h.get_by_label(tab).click();
+            settle(&mut h);
+            let top = h.get_by_label(group).rect().min.y;
+            // The group names sit on one line 82 points below the top of the groups (GROUP_H 92 less
+            // GROUP_NAME_Y 10), about 7 points either side of it.
+            let name_top = top + 75.0;
+            let controls = [
+                egui::accesskit::Role::Button,
+                egui::accesskit::Role::CheckBox,
+                egui::accesskit::Role::ComboBox,
+                egui::accesskit::Role::Slider,
+                egui::accesskit::Role::TextInput,
+            ];
+            let mut over = Vec::new();
+            for role in controls {
+                for node in h.query_all_by_role(role) {
+                    let r = node.rect();
+                    // The arrows that scroll the ribbon run its full height on purpose, at its edges.
+                    let edge_arrow = r.height() > 80.0;
+                    if !edge_arrow && r.min.y >= top - 1.0 && r.min.y < name_top && r.max.y > name_top + 0.5 && r.width() > 0.0 {
+                        over.push(format!("{:?} {:?} {:?}", node.accesskit_node().label(), role, r));
+                    }
+                }
+            }
+            assert!(over.is_empty(), "{tab} at {width}: controls run into the group names: {over:#?}");
+        }
+    }
+}
+
+/// Issue #375: the tool in hand is marked (selected state as well as colour), its properties open
+/// from its own named control, the thickness and colour picked there are what the rack then holds,
+/// and Escape closes them with the page untouched. A pen, a pencil and a highlighter alike.
+#[test]
+fn draw_presets_are_picked_and_edited_from_their_properties() {
+    let (_t, app, s) = sample_app("ui-draw-presets");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 820.0));
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    h.get_by_label("Draw").click();
+    settle(&mut h);
+    for (tool, slot, thickness, colour, hex) in [
+        ("Pen red", 1, "2.0 pt", "navy #102a6b", "102a6b"),
+        ("Pencil grey", 4, "1.0 pt", "dark green #0d4c27", "0d4c27"),
+        ("Highlighter yellow", 5, "6.0 pt", "pale yellow #faf08a", "faf08a"),
+    ] {
+        h.get_by_label(tool).click();
+        settle(&mut h);
+        assert_eq!(is_on(&h, tool), Some(true), "{tool} is the tool in hand");
+        assert_eq!(is_on(&h, "Pen black"), Some(false), "and the others are not");
+        h.get_by_label(&format!("Modify {tool}")).click();
+        settle(&mut h);
+        assert!(h.query_all_by_label_contains("Thickness: ").count() == 1, "the thickness now is written out");
+        h.get_by_label(thickness).click();
+        settle(&mut h);
+        h.get_by_label(colour).click();
+        settle(&mut h);
+        let rack = ask(&mut h, "ui.inspect", json!({})).expect("inspect")["ink"]["rack"].as_str().unwrap_or_default().to_string();
+        let nib = rack.split('|').nth(slot).unwrap_or_default().to_string();
+        assert!(nib.contains(hex), "{tool} now draws in {colour}: {nib} ({rack})");
+        assert_eq!(is_on(&h, colour), Some(true), "the colour picked is marked in the properties");
+        h.key_press(egui::Key::Escape);
+        settle(&mut h);
+        assert_eq!(h.query_all_by_label_contains("Thickness: ").count(), 0, "Escape closes the properties");
+    }
+    assert_eq!(h.state().body().unwrap_or_default(), body, "editing tools leaves the page as it was");
+}
+
+/// Issue #375: taking a tool off the rack is a second step, and the properties open from the
+/// keyboard as well as by pointer.
+#[test]
+fn deleting_a_tool_asks_first_and_its_properties_open_from_the_keyboard() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-draw-delete-tool");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 820.0));
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("Draw").click();
+    settle(&mut h);
+    h.get_by_label("Pen blue").click();
+    settle(&mut h);
+    let count = |h: &mut Harness<'_, NoteCraftApp>| {
+        ask(h, "ui.inspect", json!({})).expect("inspect")["ink"]["rack"].as_str().unwrap_or_default().split('|').count()
+    };
+    let before = count(&mut h);
+    // From the keyboard: the pen, then Tab to its properties, then Enter.
+    h.get_by_label("Pen blue").focus();
+    h.step();
+    h.key_press(egui::Key::Tab);
+    h.step();
+    let focused = h.query_by(|n| n.is_focused()).and_then(|n| n.accesskit_node().label());
+    assert_eq!(focused.as_deref(), Some("Modify Pen blue"), "Tab from the pen reaches its properties");
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    h.get_by_label("Delete Tool...").click();
+    settle(&mut h);
+    assert_eq!(count(&mut h), before, "the first click only asks");
+    h.get_by_label("Keep Tool").click();
+    settle(&mut h);
+    assert_eq!(count(&mut h), before, "Keep tool keeps it");
+    h.get_by_label("Delete Tool...").click();
+    settle(&mut h);
+    h.get_by_label("Delete Tool").click();
+    settle(&mut h);
+    assert_eq!(count(&mut h), before - 1, "the second step takes it off the rack");
+    assert_eq!(h.query_all_by_label("Pen blue").count(), 0);
+}
+
+/// Issue #375: pressure is one named control. Without a pen's readings it says "Pressure off" and
+/// why on request; once they arrive it says "Pressure on" and its sensitivity moves with the arrow
+/// keys as well as the pointer.
+#[test]
+fn the_pressure_control_names_its_state_and_explains_it_on_request() {
+    let t = TempDir::new("ui-pressure-control");
+    let mut s = pressure_session(&t);
+    let sample = create_sample(&mut s, Some(LOGO_PNG)).expect("sample");
+    let mut app = NoteCraftApp::new(s);
+    app.open_path(&sample.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 820.0));
+    settle(&mut h);
+    h.get_by_label("Draw").click();
+    h.run();
+    assert_eq!(h.query_all_by_label("Pressure off").count(), 1);
+    h.get_by_label("Why?").click();
+    h.run();
+    let why = if cfg!(target_os = "linux") { "Wayland" } else { "pressure" };
+    assert!(h.query_all_by_label_contains(why).count() > 0, "Why? explains, for this system");
+    h.key_press(egui::Key::Escape);
+    h.run();
+    h.input_mut().events.push(touch_event(egui::TouchPhase::Start, Some(0.4)));
+    h.step();
+    h.input_mut().events.push(touch_event(egui::TouchPhase::End, Some(0.4)));
+    h.step();
+    assert_eq!(h.query_all_by_label("Pressure on").count(), 1, "the readings turn it on");
+    assert_eq!(h.query_all_by_label("Why?").count(), 0);
+    h.get_by_label("Pressure sensitivity 50 of 100").focus();
+    h.step();
+    h.key_press(egui::Key::ArrowRight);
+    h.step();
+    h.step();
+    assert_eq!(h.query_all_by_label("Pressure sensitivity 55 of 100").count(), 1, "the right arrow turns it up");
+}
+
+/// Issue #374: Insert > Table can be driven from the keyboard: Enter opens the grid at 1 x 1, the
+/// arrows step the size with the readout above the grid following, Enter inserts exactly that
+/// table at the caret, and Escape goes back to the Table button. The readout keeps the last size
+/// pointed at when the pointer leaves the grid.
+#[test]
+fn insert_table_grid_answers_the_keyboard_and_keeps_its_readout() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-insert-table-keys");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 820.0));
+    notecraft_store::page::save_body(&s.md_page, "Before the table\n").expect("page");
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+    settle(&mut h);
+    h.get_by_label("Insert").click();
+    settle(&mut h);
+    let focused = |h: &Harness<'_, NoteCraftApp>| h.query_by(|n| n.is_focused()).and_then(|n| n.accesskit_node().label());
+    // Escape from the grid returns to the Table button.
+    h.get_by_label("Table").focus();
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert_eq!(focused(&h).as_deref(), Some("1 x 1 Table"), "the grid opens with its first square in hand");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.query_by_label("Insert Table...").is_none(), "Escape closes the grid");
+    assert_eq!(focused(&h).as_deref(), Some("Table"), "and the keyboard is back on the Table button");
+    // A 3 x 4 table: three columns, four rows.
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    for key in [egui::Key::ArrowRight, egui::Key::ArrowRight, egui::Key::ArrowDown, egui::Key::ArrowDown, egui::Key::ArrowDown] {
+        h.key_press(key);
+        h.step();
+    }
+    settle(&mut h);
+    assert!(h.query_all_by_label("3 x 4 Table").count() >= 1, "the readout names the size stepped to");
+    assert_eq!(focused(&h).as_deref(), Some("3 x 4 Table"));
+    // The pointer over a square and away again: the readout stays on the last size pointed at.
+    let square = h.get_by_label("2 x 2 Table").rect().center();
+    h.input_mut().events.push(egui::Event::PointerMoved(square));
+    h.step();
+    h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(5.0, 700.0)));
+    h.step();
+    h.step();
+    assert!(h.query_all_by_label("2 x 2 Table").count() >= 2, "the readout keeps 2 x 2, as well as the square of that name");
+    assert_eq!(focused(&h).as_deref(), Some("2 x 2 Table"), "the keyboard went with the pointer, so Enter takes what the readout says");
+    h.get_by_label("3 x 4 Table").focus();
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    let rows: Vec<&str> = body.lines().filter(|l| l.trim_start().starts_with('|')).collect();
+    // A header row, its rule, and the three rows under it.
+    assert_eq!(rows.len(), 5, "four rows of table and the rule under the first: {body}");
+    assert_eq!(rows[0].matches('|').count(), 4, "three columns: {body}");
+    assert!(body.find("Before the table").unwrap_or(usize::MAX) < body.find('|').unwrap_or(0), "inserted after the caret's line: {body}");
+}
+
+/// Issue #374: the stamps are one compact stack, and at a narrow width every Insert command, the
+/// stamps among them, can be reached with Tab.
+#[test]
+fn insert_time_stamps_are_one_stack_and_reachable_when_narrow() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-insert-stamps-narrow");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1000.0, 820.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("Insert").click();
+    settle(&mut h);
+    let x = |h: &Harness<'_, NoteCraftApp>, label: &str| h.get_by_label(label).rect();
+    let (date, time, both) = (x(&h, "Date"), x(&h, "Time"), x(&h, "Date & Time"));
+    assert!((date.min.x - time.min.x).abs() < 1.0 && (time.min.x - both.min.x).abs() < 1.0, "one column: {date:?} {time:?} {both:?}");
+    assert!(date.max.y <= time.min.y && time.max.y <= both.min.y, "stacked in order");
+    let focused = |h: &Harness<'_, NoteCraftApp>| h.query_by(|n| n.is_focused()).and_then(|n| n.accesskit_node().label());
+    h.get_by_label("Insert Space").focus();
+    h.step();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..60 {
+        h.key_press(egui::Key::Tab);
+        h.step();
+        if let Some(name) = focused(&h) {
+            seen.insert(name);
+        }
+        if seen.contains("Stickers") {
+            break;
+        }
+    }
+    for needed in ["Table", "File Attachment", "Pictures", "Link", "Date", "Time", "Date & Time", "Stickers"] {
+        assert!(seen.contains(needed), "{needed} is reached with Tab at 1000 points: {seen:?}");
+    }
+}
+
+/// Issue #380: a row's menu opens from the keyboard (Shift+F10 or the Menu key) on the focused row,
+/// opens at that row rather than at the pointer, stays inside the window near its bottom edge, and
+/// Escape gives the keyboard back to the row.
+#[test]
+fn a_row_menu_opens_from_the_keyboard_at_its_row_and_escape_returns() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-row-menu-keys");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1200.0, 760.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let title = notecraft_store::tree::read_node(&s.md_page).expect("page").title;
+    let row = h.get_all_by_label(&title).map(|n| n.rect()).min_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("page row");
+    let focused = |h: &Harness<'_, NoteCraftApp>| h.query_by(|n| n.is_focused()).and_then(|n| n.accesskit_node().label());
+    for (modifiers, key) in [(egui::Modifiers::SHIFT, egui::Key::F10), (egui::Modifiers::NONE, egui::Key::Menu)] {
+        h.get_all_by_label(&title).find(|n| n.rect() == row).expect("row").focus();
+        h.step();
+        h.key_press_modifiers(modifiers, key);
+        settle(&mut h);
+        let new_page = h.get_by_label("New page").rect();
+        assert!(
+            new_page.min.y >= row.min.y - 2.0 && new_page.min.y - row.max.y < 40.0,
+            "{key:?}: the menu opens at its row: {new_page:?} under {row:?}"
+        );
+        h.key_press(egui::Key::Escape);
+        settle(&mut h);
+        assert!(h.query_by_label("New page").is_none(), "Escape closes the menu");
+        assert_eq!(focused(&h).as_deref(), Some(title.as_str()), "and the row has the keyboard again");
+    }
+    // Near the bottom of a short window the menu still fits inside it.
+    let (_t2, app, s2) = sample_app("ui-row-menu-edge");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(900.0, 420.0));
+    h.state_mut().open_path(&s2.md_page.to_string_lossy());
+    settle(&mut h);
+    let title = notecraft_store::tree::read_node(&s2.md_page).expect("page").title;
+    let row = h.get_all_by_label(&title).map(|n| n.rect()).max_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("page row");
+    h.get_all_by_label(&title).find(|n| n.rect() == row).expect("row").click_secondary();
+    settle(&mut h);
+    for item in ["New page", "Rename..."] {
+        let r = h.get_by_label(item).rect();
+        assert!(r.max.y <= 420.0 && r.min.y >= 0.0 && r.max.x <= 900.0, "{item} is inside the window: {r:?}");
+    }
+}
+
+/// Issue #380: two pages side by side with one title, in separate folders. A menu acts on the row
+/// it was opened from, never on its twin.
+#[test]
+fn a_row_menu_acts_on_its_own_page_when_two_share_a_title() {
+    let (_t, app, s) = sample_app("ui-row-menu-identity");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1200.0, 760.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let section = s.md_page.parent().expect("section").to_string_lossy().into_owned();
+    let mut made = Vec::new();
+    for _ in 0..2 {
+        let page = ask(
+            &mut h,
+            "engine.execute",
+            json!({"command": "node.create", "params": {"parent": section, "kind": "page", "title": "Twin", "format": "cmgfm"}}),
+        )
+        .expect("page");
+        made.push(std::path::PathBuf::from(page.as_str().expect("a path")));
+    }
+    settle(&mut h);
+    assert_ne!(made[0], made[1], "two folders");
+    let rows: Vec<egui::Rect> = {
+        let mut r: Vec<_> = h.get_all_by_label("Twin").map(|n| n.rect()).collect();
+        r.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+        r
+    };
+    assert_eq!(rows.len(), 2, "both rows are in the page list");
+    // The lower row is the page made second.
+    h.get_all_by_label("Twin").find(|n| n.rect() == rows[1]).expect("second row").click_secondary();
+    settle(&mut h);
+    h.get_by_label("Lock read only").click();
+    settle(&mut h);
+    let locked = |p: &std::path::Path| notecraft_store::page::read_only(p).expect("read");
+    assert!(locked(&made[1]) && !locked(&made[0]), "the menu locked the row it was opened on and not its twin");
 }
 
 /// Issue #380: the tree's menu keeps the shortcut out of the label.
@@ -15944,6 +16797,95 @@ fn one_backspace_removes_one_grapheme_in_each_page_caret_without_joining_blocks(
     assert_eq!(status["page"]["blocks"], json!(3), "a second press genuinely at the start still joins the blocks");
 }
 
+/// Issue #498: with the search box focused, Ctrl+V pastes into the search box, once, and
+/// never into the page, however the paste arrives.
+#[test]
+fn ctrl_v_with_search_focused_pastes_into_search_and_not_the_page() {
+    let board = MemoryBoard::new();
+    let (_t, app, s) = sample_app("ui-search-paste");
+    let mut h = harness(app.with_clipboard(Box::new(board.clone())), LIGHT);
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("page caret");
+    settle(&mut h);
+    let before = h.state().body().expect("page body").to_owned();
+    let search_text = |h: &Harness<'_, NoteCraftApp>| {
+        h.get_all_by_role(egui::accesskit::Role::TextInput).find_map(|node| node.value().filter(|v| v.contains("needle"))).unwrap_or_default()
+    };
+    for path in ["key-only", "queued", "queued-with-event"] {
+        ask(&mut h, "ui.key", json!({"key": "F", "ctrl": true})).expect("focus search");
+        settle(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "A", "ctrl": true})).expect("select the search text");
+        pump(&mut h);
+        board.put_text("needle7731");
+        if path == "key-only" {
+            ask(&mut h, "ui.key", json!({"key": "V", "ctrl": true})).expect("Ctrl+V");
+        } else {
+            h.state_mut().queue_keyboard_paste();
+            if path == "queued-with-event" {
+                h.event(egui::Event::Paste("needle7731".into()));
+            }
+        }
+        settle(&mut h);
+        assert_eq!(h.state().body().expect("page body"), before, "{path} pasted into the page");
+        assert_eq!(search_text(&h), "needle7731", "{path} puts the text into the search box once");
+        ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("leave search");
+        settle(&mut h);
+    }
+    // A table copied from a spreadsheet is pasted by the page itself, as blocks: not while the
+    // search box has the keyboard either.
+    ask(&mut h, "ui.key", json!({"key": "F", "ctrl": true})).expect("focus search");
+    settle(&mut h);
+    board.put_text("needle\tcell\nrow\ttwo");
+    ask(&mut h, "ui.key", json!({"key": "V", "ctrl": true})).expect("Ctrl+V");
+    settle(&mut h);
+    assert_eq!(h.state().body().expect("page body"), before, "a table paste stays out of the page");
+    ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("leave search");
+    settle(&mut h);
+    // With the search box left, Ctrl+V pastes into the page again.
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("page caret");
+    settle(&mut h);
+    board.put_text("page paste still works");
+    h.state_mut().queue_keyboard_paste();
+    settle(&mut h);
+    assert!(h.state().body().unwrap_or_default().contains("page paste still works"));
+}
+
+/// The caret of a right-to-left line is a text box of NoteCraft's own. It took the keyboard back
+/// on every frame, so with it on the page nothing could be typed into the search box.
+#[test]
+fn a_right_to_left_caret_leaves_the_keyboard_to_the_search_box() {
+    let (_t, app, s) = sample_app("ui-search-rtl-caret");
+    notecraft_store::page::save_body(&s.html_page, "<p>\u{645}\u{631}\u{62d}\u{628}\u{627} hello</p>").expect("an Arabic line");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("page caret");
+    settle(&mut h);
+    let before = h.state().body().expect("page body").to_owned();
+    ask(&mut h, "ui.key", json!({"key": "F", "ctrl": true})).expect("focus search");
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "zebra9917"})).expect("type");
+    settle(&mut h);
+    assert_eq!(h.state().body().expect("page body"), before, "the typing did not go into the page");
+    let typed = h.get_all_by_role(egui::accesskit::Role::TextInput).any(|node| node.value().is_some_and(|v| v.contains("zebra9917")));
+    assert!(typed, "the typing went into the search box");
+    // Tab on from the search box: the control it reaches keeps the keyboard, frame after frame.
+    ask(&mut h, "ui.key", json!({"key": "Tab"})).expect("Tab");
+    for _ in 0..4 {
+        settle(&mut h);
+    }
+    ask(&mut h, "ui.text", json!({"text": "q"})).expect("type");
+    settle(&mut h);
+    assert_eq!(h.state().body().expect("page body"), before, "the caret did not take the keyboard back");
+    // A click on the line gives it the keyboard again.
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("page caret");
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "!"})).expect("type");
+    settle(&mut h);
+    assert_ne!(h.state().body().expect("page body"), before, "typing goes into the line once the caret is put there");
+}
+
 /// The picker search, not the underlying note, owns native clipboard shortcuts.
 #[test]
 fn emoji_picker_paste_stays_in_search_then_page_paste_resumes() {
@@ -16152,11 +17094,11 @@ fn locked_pages_explain_the_lock_and_keep_version_preview_available() {
     settle(&mut h);
     h.get_by_label("Page Versions").click();
     settle(&mut h);
-    assert!(h.get_by_label("Restore").accesskit_node().is_disabled());
-    h.get_by_label("Preview").click();
+    assert!(h.get_by_label("Restore this version").accesskit_node().is_disabled());
+    h.get_all_by_label_contains("Saved version, ").next().expect("a saved version").click();
     settle(&mut h);
     assert!(h.get_by_label("Restore this version").accesskit_node().is_disabled());
-    assert!(h.query_by_label("Back to the list").is_some(), "preview stays usable");
+    assert!(h.query_by_label_contains("An older version, read-only").is_some(), "preview stays usable");
     assert_eq!(std::fs::read(&file).expect("locked page"), before);
 }
 

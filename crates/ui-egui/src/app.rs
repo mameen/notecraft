@@ -113,6 +113,8 @@ const DISCORD_URL: &str = "https://discord.gg/artcraft";
 const RACK_KEY: &str = "pen_rack";
 /// The size the whole window is drawn at, in percent: see `backstage::UI_SCALES`.
 const UI_SCALE_KEY: &str = "ui_scale";
+/// The paper File > Print used last, for the next print of a page with no paper of its own.
+const PRINT_PAPER_KEY: &str = "print_paper";
 const NIB_KEY: &str = "pen_in_hand";
 const SENSITIVITY_KEY: &str = "pen_sensitivity";
 const DEFAULT_SENSITIVITY: u8 = 50;
@@ -199,6 +201,55 @@ const INDENT: f32 = 14.0;
 const WIZARD_SCREEN_MARGIN: f32 = 2.0 * (16.0 + 2.0 + 8.0);
 /// The height kept below the wizard's scrolling body for its Back, Next and Finish buttons.
 const WIZARD_BUTTON_ROW: f32 = 56.0;
+
+/// One result of a History search (Recent Edits, Find by Author; issue #382): the page's title as
+/// the link that opens it, and under it where it is and when it was last changed, so two pages
+/// of one name are told apart by their place and time. Returns true when it was chosen.
+fn result_row(ui: &mut Ui, t: &Tokens, title: &str, notebook: &str, section: &[String], when: Option<&str>, note: Option<&str>) -> bool {
+    let title = if title.is_empty() { crate::tl_id!("ui.untitled_page").to_string() } else { title.to_string() };
+    let mut place = vec![notebook.to_string()];
+    place.extend(section.iter().cloned());
+    let place = place.join(&format!(" {} ", crate::tl_id!("ui.place_separator")));
+    let detail = when.map_or_else(|| place.clone(), |when| format!("{place} \u{b7} {when}"));
+    let mut clicked = false;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        let tip = note.map_or_else(|| detail.clone(), |note| format!("{detail}\n{note}"));
+        clicked = ui.link(title).on_hover_text(tip).clicked();
+        ui.label(egui::RichText::new(detail).small().color(t.muted));
+    });
+    ui.add_space(4.0);
+    clicked
+}
+
+/// When the page was last saved, as an ISO time, for Page Versions' "Current page": the stamp the
+/// page keeps in its own file, which the web build's files can give as well as a desktop's.
+fn page_saved_at(page: &Path) -> Option<String> {
+    notecraft_store::recent::stamp(page).map(notecraft_model::time::iso_from_secs)
+}
+
+/// One row of Page Versions' list (issue #382): what it is ("Current page", "Saved version") over
+/// when, selected with the accent edge the recycle bin uses. A screen reader hears both lines.
+fn version_row(ui: &mut Ui, t: &Tokens, title: &str, sub: &str, selected: bool) -> egui::Response {
+    let (rect, row) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::click());
+    let painter = ui.painter_at(rect);
+    if selected {
+        painter.rect_filled(rect, 4.0, t.row_selected);
+        painter.rect_filled(egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height())), 2.0, t.accent);
+    } else if row.hovered() {
+        painter.rect_filled(rect, 4.0, t.row_hover);
+    }
+    if row.has_focus() {
+        painter.rect_stroke(rect.shrink(1.0), 4.0, egui::Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
+    }
+    let room = (rect.width() - 22.0).max(20.0);
+    painter.text(egui::pos2(rect.min.x + 12.0, rect.min.y + 13.0), Align2::LEFT_CENTER, title, egui::FontId::proportional(13.5), t.text);
+    let shown = fit_to_width(ui, sub, 12.0, room);
+    crate::bidi::line_at(ui, &painter, egui::pos2(rect.min.x + 12.0, rect.min.y + 30.0), Align2::LEFT_CENTER, &shown, 12.0, t.muted, None);
+    let heard = format!("{title}, {sub}");
+    row.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, heard.clone()));
+    row.on_hover_text(sub)
+}
 
 pub(crate) fn modal_frame(tokens: &Tokens) -> egui::Frame {
     egui::Frame::NONE.fill(tokens.panel).stroke(egui::Stroke::new(1.5, tokens.accent)).inner_margin(egui::Margin::same(16))
@@ -1382,6 +1433,8 @@ pub struct NoteCraftApp {
     custom_tags: Option<crate::customtags::Dialog>,
     /// Copy Text from Picture while its dialog is open (issue #274).
     picture_text: Option<crate::picture_text::Dialog>,
+    /// File > Print while its dialog is open (issue #168).
+    print: Option<crate::print::Dialog>,
     /// A paste meant for the text box of such a dialog, held while the page is drawn.
     modal_paste: Option<String>,
     templates_pane: Option<TemplatesPane>,
@@ -1610,7 +1663,7 @@ impl NoteCraftApp {
         let sensitivity = session.settings.get(SENSITIVITY_KEY).and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(DEFAULT_SENSITIVITY).min(100);
         let qat = quickaccess::Config::load(|k| session.settings.get(k));
         // `--first-use` clears the key to an empty value, which counts as not seen.
-        let privacy_welcome = session.settings.get("privacy_welcome_seen").is_none_or(|v| v.trim().is_empty());
+        let privacy_welcome = session.settings.first_use_pending();
         let telemetry_level = session.settings.get("telemetry_level").unwrap_or_else(|| default_telemetry_level(cfg!(debug_assertions)).to_string());
         log::info!("privacy welcome modal state: show={} telemetry_level={:?}", privacy_welcome, telemetry_level);
         let wizard_format = session.settings.global_format().0;
@@ -1676,6 +1729,7 @@ impl NoteCraftApp {
             tags_pane: None,
             custom_tags: None,
             picture_text: None,
+            print: None,
             modal_paste: None,
             templates_pane: None,
             cursor: 0,
@@ -2618,6 +2672,11 @@ impl NoteCraftApp {
     }
 
     /// The page's zoom, in percent, as the View tab shows it.
+    /// Whether the page has the whole window (Full Page View).
+    pub fn is_full_page(&self) -> bool {
+        self.full_page
+    }
+
     pub fn zoom_percent(&self) -> u32 {
         self.zoom_percent
     }
@@ -3083,6 +3142,13 @@ impl NoteCraftApp {
     fn show_recent_edits(&mut self, range: RecentRange, this_notebook: bool) {
         let items = self.recent_edits(range, this_notebook);
         self.dialog = Some(Dialog::RecentEdits { range, this_notebook, filter: String::new(), items });
+    }
+
+    /// History > Page Versions for the open page, as the ribbon and the page's menu open it.
+    pub fn open_page_versions(&mut self) {
+        if let Some(page) = self.current_page().map(Path::to_path_buf) {
+            self.show_page_versions(&page);
+        }
     }
 
     fn show_page_versions(&mut self, page: &Path) {
@@ -4368,7 +4434,7 @@ impl NoteCraftApp {
                 acts.push(Act::Select(node.path.clone()));
             }
         }
-        resp.context_menu(|ui| {
+        floating::row_menu(&resp, |ui| {
             // A locked page keeps its menu, with the changes to it greyed out (issue #441). Read
             // from the page's head only while this menu is open.
             let edits_off = node.info.kind == NodeKind::Page && notecraft_store::page::read_only(&node.path).unwrap_or(false);
@@ -4936,6 +5002,7 @@ impl NoteCraftApp {
                 self.ui_scale,
                 self.auto_switch,
                 self.update_check_off,
+                self.session.settings.welcome_notebook_update_prompt(),
                 &update,
                 &mut copy,
                 &mut account,
@@ -4950,6 +5017,11 @@ impl NoteCraftApp {
                 backstage::Act::Close => {
                     let _ = self.session.run("export.cancel", &Params::new());
                     self.backstage = None;
+                }
+                backstage::Act::Print => {
+                    let _ = self.session.run("export.cancel", &Params::new());
+                    self.backstage = None;
+                    self.open_print();
                 }
                 backstage::Act::Page(name) => {
                     let _ = self.session.run("export.cancel", &Params::new());
@@ -5002,6 +5074,14 @@ impl NoteCraftApp {
                     match self.session.settings.set("update_check_off_at_start", if off { "true" } else { "false" }) {
                         Ok(()) => self.update_check_off = off,
                         Err(e) => self.complain(&crate::i18n::format_message_id("ui.update_check_not_saved", &[("error", &e.to_string())])),
+                    }
+                }
+                backstage::Act::SetWelcomeNotebookUpdatePrompt(enabled) => {
+                    if let Err(error) = self.session.settings.set_welcome_notebook_update_prompt(enabled) {
+                        self.complain(&crate::i18n::format_message_id(
+                            "ui.welcome_notebook_update_prompt_not_saved",
+                            &[("error", &error.to_string())],
+                        ));
                     }
                 }
                 backstage::Act::ChooseNotebooksFolder => self.choose_default_notebooks_folder(),
@@ -5505,7 +5585,8 @@ impl NoteCraftApp {
             always_on_top: self.always_on_top,
             docked: self.docked.is_some(),
             full_page: self.full_page,
-            rules: self.rules,
+            // The paper the page is drawn on: its own, or the window's (what Rule lines shows).
+            rules: self.paper_now(),
             hide_title: self.hide_title,
             snap: self.snap_to_grid,
             zoom_percent: self.zoom_percent,
@@ -7515,6 +7596,62 @@ impl NoteCraftApp {
         self.picture_text = Some(crate::picture_text::Dialog::start(scope, pictures, self.ocr_models()));
     }
 
+    /// File > Print or Ctrl+P (issue #168): the open page's work is saved first, so what is printed is
+    /// what the page holds, and the Print dialog opens for it.
+    pub fn open_print(&mut self) {
+        let Some(dir) = self.editor.as_ref().map(|e| e.dir.clone()) else {
+            self.say(crate::tl_id!("ui.open_a_page_first"));
+            return;
+        };
+        self.save_now();
+        if self.is_dirty() {
+            self.complain(crate::tl_id!("ui.print_save_first"));
+            return;
+        }
+        let remembered = self.session.settings.get(PRINT_PAPER_KEY).and_then(|p| notecraft_model::paper::Paper::parse(&p));
+        self.print = Some(crate::print::Dialog::new(&dir, remembered));
+    }
+
+    /// Whether the Print dialog is open.
+    pub fn printing(&self) -> bool {
+        self.print.is_some()
+    }
+
+    /// Shows the Print dialog while it is open, and saves the PDF it asks for.
+    fn print_dialog(&mut self, ctx: &Context) {
+        let Some(mut dialog) = self.print.take() else { return };
+        self.give_modal_paste(ctx);
+        let out = dialog.show(ctx, &self.tokens);
+        if let Some(said) = out.said {
+            self.say(said);
+            let _ = self.session.settings.set(PRINT_PAPER_KEY, &dialog.layout.paper.write());
+        }
+        if let Some((bytes, name)) = out.save_pdf {
+            let _ = self.session.settings.set(PRINT_PAPER_KEY, &dialog.layout.paper.write());
+            self.save_pdf(bytes, &name);
+        }
+        if !out.closed {
+            self.print = Some(dialog);
+        }
+    }
+
+    /// Saves a printed PDF: where the person chooses, or as a download in a browser.
+    fn save_pdf(&mut self, bytes: Vec<u8>, name: &str) {
+        if let Some(downloads) = self.file_downloads.as_mut() {
+            downloads.push(FileDownload { name: name.to_string(), mime: "application/pdf", bytes });
+            self.say(crate::i18n::format_message_id("ui.print_saved_pdf", &[("path", name)]));
+            return;
+        }
+        let Some(destination) = pick_pdf_destination(name) else { return };
+        match std::fs::write(&destination, &bytes) {
+            Ok(()) => {
+                let shown = self.shown(&destination);
+                self.say(crate::i18n::format_message_id("ui.print_saved_pdf", &[("path", &shown)]));
+            }
+            Err(e) => self.complain(&crate::i18n::format_message_id("ui.print_could_not_save_pdf", &[("error", &e.to_string())])),
+        }
+    }
+
     /// The folder with the text recognition models, when one is set.
     fn ocr_models(&self) -> Option<PathBuf> {
         self.session.settings.get("ocr_models").filter(|v| !v.trim().is_empty()).map(PathBuf::from)
@@ -8648,10 +8785,10 @@ impl NoteCraftApp {
             || input.raw.events.iter().any(event_hit)
     }
 
-    /// Whether one of the dialogs drawn outside `self.dialog` is open: Copy Text from Picture. It
-    /// owns the keyboard as `self.dialog` does, so the page's shortcuts and paste wait.
+    /// Whether one of the dialogs drawn outside `self.dialog` is open: Copy Text from Picture or
+    /// Print. It owns the keyboard as `self.dialog` does, so the page's shortcuts and paste wait.
     fn own_modal_open(&self) -> bool {
-        self.picture_text.is_some()
+        self.picture_text.is_some() || self.print.is_some()
     }
 
     /// Ctrl+V while such a dialog is open: the clipboard's text goes to the dialog's text box when
@@ -8696,6 +8833,15 @@ impl NoteCraftApp {
             ctx.input_mut(|input| input.events.retain(|event| !matches!(event, egui::Event::Paste(_) | egui::Event::PasteImage(_))));
             return;
         }
+        self.paste_text_into_focus(ctx, queued);
+    }
+
+    /// Ctrl+V into a text box of the window's own that has the keyboard (the emoji picker's search,
+    /// or the search box): the clipboard's text, once. The desktop shell catches a paste before
+    /// egui, and a key press alone carries no text, so the text is added as egui's own paste
+    /// unless the frame already has one. A picture on the clipboard goes nowhere.
+    fn paste_text_into_focus(&mut self, ctx: &egui::Context, queued: bool) {
+        ctx.input_mut(|input| input.events.retain(|event| !matches!(event, egui::Event::PasteImage(_))));
         let needs_text = ctx.input(|input| {
             (queued || Self::clipboard_key_hit(input, Key::V)) && !input.events.iter().any(|event| matches!(event, egui::Event::Paste(_)))
         });
@@ -11025,6 +11171,7 @@ impl NoteCraftApp {
             self.reader = None;
         }
         self.picture_text_dialog(ctx);
+        self.print_dialog(ctx);
         if let Some(mut dialog) = self.custom_tags.take() {
             let out = dialog.show(ctx, &self.tokens);
             if let Some(list) = out.changed {
@@ -12308,20 +12455,11 @@ impl NoteCraftApp {
                                 ui.separator();
                                 egui::ScrollArea::vertical().max_height(380.0).auto_shrink([false, true]).show(ui, |ui| {
                                     for p in notecraft_store::authors::by(pages, who.as_deref()) {
-                                        ui.horizontal(|ui| {
-                                            let title =
-                                                if p.title.is_empty() { crate::tl_id!("ui.untitled_page").to_string() } else { p.title.clone() };
-                                            if ui.link(title).clicked() {
-                                                go = Some(p.page.clone());
-                                            }
-                                            let mut place = vec![p.notebook.clone()];
-                                            place.extend(p.section.iter().cloned());
-                                            ui.label(
-                                                egui::RichText::new(place.join(&format!(" {} ", crate::tl_id!("ui.place_separator"))))
-                                                    .small()
-                                                    .color(t.muted),
-                                            );
-                                        });
+                                        let when = notecraft_store::recent::stamp(&p.page)
+                                            .and_then(|at| notecraft_model::time::long_from_iso(&notecraft_model::time::iso_from_secs(at)));
+                                        if result_row(ui, &t, &p.title, &p.notebook, &p.section, when.as_deref(), None) {
+                                            go = Some(p.page.clone());
+                                        }
                                     }
                                 });
                                 ui.add_space(6.0);
@@ -12396,28 +12534,12 @@ impl NoteCraftApp {
                         }
                         egui::ScrollArea::vertical().max_height(380.0).auto_shrink([false, true]).show(ui, |ui| {
                             for e in shown {
-                                ui.horizontal(|ui| {
-                                    let title = if e.title.is_empty() { crate::tl_id!("ui.untitled_page").to_string() } else { e.title.clone() };
-                                    if ui.link(title).clicked() {
-                                        go = Some(e.page.clone());
-                                    }
-                                    let mut place = vec![e.notebook.clone()];
-                                    place.extend(e.section.iter().cloned());
-                                    ui.label(
-                                        egui::RichText::new(place.join(&format!(" {} ", crate::tl_id!("ui.place_separator")))).small().color(t.muted),
-                                    );
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let when =
-                                            notecraft_model::time::long_from_iso(&notecraft_model::time::iso_from_secs(e.at)).unwrap_or_default();
-                                        let label = egui::RichText::new(when).small().color(t.muted);
-                                        let resp = ui.label(label);
-                                        if !e.stamped {
-                                            resp.on_hover_text(crate::tl_id!(
-                                                "ui.this_page_keeps_no_time_of_its_own_this_is_when_its_file_was_last_changed"
-                                            ));
-                                        }
-                                    });
-                                });
+                                let when = notecraft_model::time::long_from_iso(&notecraft_model::time::iso_from_secs(e.at)).unwrap_or_default();
+                                let note = (!e.stamped)
+                                    .then_some(crate::tl_id!("ui.this_page_keeps_no_time_of_its_own_this_is_when_its_file_was_last_changed"));
+                                if result_row(ui, &t, &e.title, &e.notebook, &e.section, Some(&when), note) {
+                                    go = Some(e.page.clone());
+                                }
                             }
                         });
                         ui.add_space(8.0);
@@ -12434,118 +12556,238 @@ impl NoteCraftApp {
                 }
             }
             Dialog::PageVersions { page, versions, preview } => {
+                // Issue #382: a review workspace. The list (the current page, then each saved
+                // version with when it was saved) sits beside the preview of the one selected, or
+                // above it in a narrow window. Selecting a row is how a version is looked at;
+                // Restore acts on the selected version only; Return to page or Escape leaves the
+                // page as it was.
                 let can_restore = notecraft_store::page::read_only(page).is_ok_and(|locked| !locked);
                 let mut restore: Option<String> = None;
-                let mut open: Option<(String, String)> = None;
-                let mut back = false;
+                // `Some(None)` selects the current page, `Some(Some(i))` saved version `i`.
+                let mut select: Option<Option<usize>> = None;
                 let t = self.tokens;
+                let selected = preview.as_ref().and_then(|p| versions.iter().position(|v| v.id == p.id));
+                if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+                    keep = false;
+                }
+                // Up and Down move through the list, as in any list, while no text box has the keys.
+                if !ctx.egui_wants_keyboard_input() {
+                    let rows = versions.len();
+                    let (up, down) =
+                        ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::ArrowUp), i.consume_key(Modifiers::NONE, Key::ArrowDown)));
+                    if down && rows > 0 {
+                        select = Some(Some(selected.map_or(0, |n| (n + 1).min(rows - 1))));
+                    } else if up {
+                        select = Some(selected.and_then(|n| n.checked_sub(1)));
+                    }
+                }
+                // A row picked with the keys is scrolled into sight on the next frame, when it is drawn
+                // as the selected one.
+                let reveal_id = egui::Id::new("page-versions-reveal");
+                let reveal = ctx.data_mut(|d| d.remove_temp::<bool>(reveal_id)).unwrap_or(false);
+                if select.is_some() {
+                    ctx.data_mut(|d| d.insert_temp(reveal_id, true));
+                }
+                let screen = ctx.viewport_rect();
+                let width = (screen.width() - 48.0).clamp(320.0, 980.0);
+                let side_by_side = width >= 720.0;
+                let height = (screen.height() * 0.78 - 170.0).max(160.0);
+                let saved_at = page_saved_at(page).map(|iso| crate::versions::when(&iso));
+                let backdrop = modal_backdrop(ctx, "page-versions-backdrop");
                 egui::Window::new(crate::tl_id!("ui.page_versions_2"))
+                    .title_bar(false)
                     .collapsible(false)
-                    .resizable(true)
+                    .resizable(false)
+                    .order(egui::Order::Foreground)
+                    .fixed_size(vec2(width, 0.0))
                     .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                    .frame(modal_frame(&t))
                     .show(ctx, |ui| {
-                        ui.set_min_width(420.0);
+                        stay_above(ui, backdrop);
+                        ui.set_width(width);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(crate::tl_id!("ui.page_versions_2")).strong().size(18.0).color(t.strong));
+                            let title = notecraft_store::tree::read_node(page).map(|n| n.title).unwrap_or_default();
+                            if !title.is_empty() {
+                                ui.label(egui::RichText::new(title).color(t.muted));
+                            }
+                        });
                         if !can_restore {
                             ui.colored_label(t.warn, crate::tl_id!("ui.page_is_read_only"));
                         }
-                        if let Some(p) = preview.as_mut() {
-                            // An older version, read-only (issue #278): said in the window
-                            // itself, so it is never taken for the page.
-                            ui.set_min_width(560.0);
-                            ui.label(egui::RichText::new(crate::i18n::format_message_id("ui.version_saved_when", &[("when", &p.when)])).strong());
-                            ui.colored_label(t.warn, crate::tl_id!("ui.an_older_version_read_only_the_page_is_not_changed_unless_you_restore_it"));
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                if ui.selectable_label(!p.comparing, crate::tl_id!("ui.this_version")).clicked() {
-                                    p.comparing = false;
-                                }
-                                if ui.selectable_label(p.comparing, crate::tl_id!("ui.compare_with_the_page")).clicked() {
-                                    p.comparing = true;
-                                }
-                            });
-                            ui.separator();
-                            egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
-                                if p.comparing {
-                                    let changed = p.changes.iter().any(|c| !matches!(c, crate::versions::Change::Same(_)));
-                                    if p.truncated {
-                                        ui.label(crate::tl_id!("ui.page_version_comparison_truncated"));
-                                    } else if !changed {
-                                        ui.label(crate::tl_id!("ui.this_version_has_the_same_words_as_the_page"));
-                                    }
-                                    for change in &p.changes {
-                                        let (mark, line, colour) = match change {
-                                            crate::versions::Change::Same(l) => ("  ", l, t.muted),
-                                            crate::versions::Change::OnlyThen(l) => ("− ", l, t.warn),
-                                            crate::versions::Change::OnlyNow(l) => ("+ ", l, t.accent),
-                                        };
-                                        ui.label(egui::RichText::new(format!("{mark}{line}")).monospace().color(colour));
-                                    }
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(crate::tl_id!(
-                                            "ui.lines_marked_are_only_in_this_version_lines_marked_are_only_in_the_page"
-                                        ))
-                                        .small()
-                                        .color(t.muted),
+                        ui.separator();
+                        let list = |ui: &mut Ui, select: &mut Option<Option<usize>>, list_height: f32| {
+                            // A height of its own: the window is sized to what it holds, and a list left to
+                            // shrink to the room it is given showed one row and hid the next.
+                            egui::ScrollArea::vertical()
+                                .id_salt("page-versions-list")
+                                .max_height(list_height)
+                                .min_scrolled_height(list_height)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    let current_sub = saved_at.as_ref().map_or_else(
+                                        || crate::tl_id!("ui.the_page_as_it_is_now").to_string(),
+                                        |when| crate::i18n::format_message_id("ui.saved_when", &[("when", when)]),
                                     );
-                                } else {
-                                    let _ = crate::preview::show(ui, &p.blocks, page, &t, None, &notecraft_model::justify::Justified::default());
-                                }
-                            });
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                if modal_button_enabled(ui, &t, crate::tl_id!("ui.restore_this_version"), true, can_restore).clicked() {
-                                    restore = Some(p.id.clone());
-                                }
-                                if modal_button(ui, &t, crate::tl_id!("ui.back_to_the_list"), false).clicked() {
-                                    back = true;
-                                }
-                                if modal_button(ui, &t, crate::tl_id!("ui.close"), false).clicked() {
-                                    keep = false;
-                                }
-                            });
-                            return;
-                        }
-                        ui.label(crate::tl_id!("ui.saved_copies_of_this_page"));
-                        ui.add_space(6.0);
-                        if versions.is_empty() {
-                            ui.label(crate::tl_id!("ui.no_saved_versions_yet_notecraft_keeps_a_copy_when_th_aa2e25acad"));
-                        } else {
-                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                                for version in versions.iter() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(crate::versions::when(&version.created));
-                                        let size = (version.bytes.div_ceil(1024)).to_string();
-                                        let size = crate::i18n::format_message_id("ui.size_kb", &[("size", &size)]);
-                                        ui.label(egui::RichText::new(size).small().color(t.muted));
-                                        // Issue #382: looking first is the primary step; restoring
-                                        // replaces the page, so it is the quieter of the two here.
-                                        if modal_button(ui, &t, crate::tl_id!("ui.preview"), true).clicked() {
-                                            open = Some((version.id.clone(), version.created.clone()));
+                                    let current = version_row(ui, &t, crate::tl_id!("ui.current_page"), &current_sub, selected.is_none());
+                                    if reveal && selected.is_none() {
+                                        current.scroll_to_me(None);
+                                    }
+                                    if current.clicked() {
+                                        *select = Some(None);
+                                    }
+                                    for (n, version) in versions.iter().enumerate() {
+                                        let size =
+                                            crate::i18n::format_message_id("ui.size_kb", &[("size", &version.bytes.div_ceil(1024).to_string())]);
+                                        let sub = format!("{} \u{b7} {size}", crate::versions::when(&version.created));
+                                        let row = version_row(ui, &t, crate::tl_id!("ui.saved_version"), &sub, selected == Some(n));
+                                        if reveal && selected == Some(n) {
+                                            row.scroll_to_me(None);
                                         }
-                                        if modal_button_enabled(ui, &t, crate::tl_id!("ui.restore"), false, can_restore).clicked() {
-                                            restore = Some(version.id.clone());
+                                        if row.clicked() {
+                                            *select = Some(Some(n));
                                         }
+                                    }
+                                    if versions.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(crate::tl_id!("ui.no_saved_versions_yet_notecraft_keeps_a_copy_when_th_aa2e25acad"))
+                                                .small()
+                                                .color(t.muted),
+                                        );
+                                    }
+                                });
+                        };
+                        let shown = |ui: &mut Ui, preview: &mut Option<Box<crate::versions::Preview>>, preview_height: f32| {
+                            ui.vertical(|ui| {
+                                let Some(p) = preview.as_mut() else {
+                                    ui.label(egui::RichText::new(crate::tl_id!("ui.current_page")).strong().size(15.0).color(t.text));
+                                    ui.label(egui::RichText::new(crate::tl_id!("ui.current_page_explainer")).color(t.muted));
+                                    return;
+                                };
+                                // A saved version, read-only (issue #278): said in the pane itself,
+                                // so it is never taken for the page.
+                                ui.label(
+                                    egui::RichText::new(crate::i18n::format_message_id("ui.saved_version_when", &[("when", &p.when)]))
+                                        .strong()
+                                        .size(15.0)
+                                        .color(t.text),
+                                );
+                                ui.colored_label(
+                                    t.warn,
+                                    crate::tl_id!("ui.an_older_version_read_only_the_page_is_not_changed_unless_you_restore_it"),
+                                );
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(crate::tl_id!("ui.show")).small().color(t.muted));
+                                    if ui.selectable_label(!p.comparing, crate::tl_id!("ui.this_version")).clicked() {
+                                        p.comparing = false;
+                                    }
+                                    if ui.selectable_label(p.comparing, crate::tl_id!("ui.compare_with_the_page")).clicked() {
+                                        p.comparing = true;
+                                    }
+                                });
+                                ui.separator();
+                                // The preview is its own surface: the paper colour, framed, so the
+                                // version does not read as the live page behind the window.
+                                egui::Frame::new()
+                                    .fill(t.editor)
+                                    .stroke(egui::Stroke::new(1.0, t.faint))
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::same(8))
+                                    .show(ui, |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("page-version-preview")
+                                            .max_height(preview_height)
+                                            .min_scrolled_height(preview_height)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                if p.comparing {
+                                                    let changed = p.changes.iter().any(|c| !matches!(c, crate::versions::Change::Same(_)));
+                                                    if p.truncated {
+                                                        ui.label(crate::tl_id!("ui.page_version_comparison_truncated"));
+                                                    } else if !changed {
+                                                        ui.label(crate::tl_id!("ui.this_version_has_the_same_words_as_the_page"));
+                                                    }
+                                                    for change in &p.changes {
+                                                        let (mark, line, colour) = match change {
+                                                            crate::versions::Change::Same(l) => ("  ", l, t.muted),
+                                                            crate::versions::Change::OnlyThen(l) => ("− ", l, t.warn),
+                                                            crate::versions::Change::OnlyNow(l) => ("+ ", l, t.accent),
+                                                        };
+                                                        ui.label(egui::RichText::new(format!("{mark}{line}")).monospace().color(colour));
+                                                    }
+                                                    ui.add_space(4.0);
+                                                    ui.label(
+                                                        egui::RichText::new(crate::tl_id!(
+                                                            "ui.lines_marked_are_only_in_this_version_lines_marked_are_only_in_the_page"
+                                                        ))
+                                                        .small()
+                                                        .color(t.muted),
+                                                    );
+                                                } else {
+                                                    let _ = crate::preview::show(
+                                                        ui,
+                                                        &p.blocks,
+                                                        page,
+                                                        &t,
+                                                        None,
+                                                        &notecraft_model::justify::Justified::default(),
+                                                    );
+                                                }
+                                            });
                                     });
-                                }
                             });
+                        };
+                        if side_by_side {
+                            ui.horizontal_top(|ui| {
+                                let list_width = 270.0;
+                                ui.allocate_ui_with_layout(vec2(list_width, height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                    ui.set_width(list_width);
+                                    list(ui, &mut select, height);
+                                });
+                                ui.separator();
+                                ui.allocate_ui_with_layout(vec2(ui.available_width(), height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                    shown(ui, preview, height - 110.0);
+                                });
+                            });
+                        } else {
+                            list(ui, &mut select, (height * 0.35).max(120.0));
+                            ui.separator();
+                            shown(ui, preview, (height * 0.55).max(140.0));
                         }
                         ui.add_space(8.0);
-                        if modal_button(ui, &t, crate::tl_id!("ui.close"), false).clicked() {
-                            keep = false;
-                        }
+                        ui.horizontal(|ui| {
+                            let chosen = preview.as_ref().map(|p| p.id.clone());
+                            if modal_button_enabled(ui, &t, crate::tl_id!("ui.restore_this_version"), true, can_restore && chosen.is_some()).clicked()
+                            {
+                                restore = chosen;
+                            }
+                            if modal_button(ui, &t, crate::tl_id!("ui.return_to_page"), false).clicked() {
+                                keep = false;
+                            }
+                        });
                     });
-                if back {
-                    *preview = None;
-                }
-                if let Some((id, created)) = open {
-                    // Compared with the page as it stands, unsaved words included.
-                    let now = self.editor.as_ref().filter(|e| e.dir == *page).map(|e| e.body.clone());
-                    let now = now.or_else(|| notecraft_store::page::load_page(page).ok().map(|p| p.body)).unwrap_or_default();
-                    match crate::versions::open(page, &id, &created, &now) {
-                        Ok(p) => *preview = Some(Box::new(p)),
-                        Err(e) => self.complain(&crate::i18n::format_message_id("ui.cannot_open_that_version_error", &[("error", &e)])),
+                match select {
+                    Some(None) => *preview = None,
+                    Some(Some(n)) if Some(n) != selected => {
+                        if let Some(version) = versions.get(n) {
+                            // Compared with the page as it stands, unsaved words included.
+                            let now = self.editor.as_ref().filter(|e| e.dir == *page).map(|e| e.body.clone());
+                            let now = now.or_else(|| notecraft_store::page::load_page(page).ok().map(|p| p.body)).unwrap_or_default();
+                            let comparing = preview.as_ref().is_some_and(|p| p.comparing);
+                            match crate::versions::open(page, &version.id, &version.created, &now) {
+                                Ok(mut p) => {
+                                    // The mode chosen stays as one version is swapped for another.
+                                    p.comparing = comparing;
+                                    *preview = Some(Box::new(p));
+                                }
+                                Err(e) => self.complain(&crate::i18n::format_message_id("ui.cannot_open_that_version_error", &[("error", &e)])),
+                            }
+                        }
                     }
+                    _ => {}
                 }
                 if let Some(id) = restore
                     && self.run("page.version.restore", &params(&[("path", &path_str(page)), ("id", &id)])).is_some()
@@ -13471,10 +13713,15 @@ impl NoteCraftApp {
         // A dialog of the window's own (Copy Text from Picture) owns the keyboard: a paste goes into
         // its text box, never into the page behind it.
         let modal = self.own_modal_open();
+        // So does the search box when it has the keyboard: Ctrl+V there was pasted into the page
+        // (issue #498).
+        let search_focused = ctx.memory(|memory| memory.has_focus(search_id));
         if emoji_picker_open {
             self.paste_into_emoji_search(ctx, queued_paste);
         } else if modal {
             self.paste_into_modal(ctx, queued_paste);
+        } else if search_focused {
+            self.paste_text_into_focus(ctx, queued_paste);
         } else if queued_paste {
             log::debug!("queued keyboard paste dispatched to paste_here");
             self.paste_here();
@@ -13484,7 +13731,7 @@ impl NoteCraftApp {
         if let Some(notice) = crate::filepicker::take_notice() {
             self.say(notice);
         }
-        if !emoji_picker_open && !modal {
+        if !emoji_picker_open && !modal && !search_focused {
             self.clipboard_keys(ctx);
         }
         self.poll_control(ctx);
@@ -13493,6 +13740,37 @@ impl NoteCraftApp {
         self.poll_voice(ctx);
         if !self.event_frames.is_empty() {
             ctx.request_repaint();
+        }
+        // Ctrl+P prints the open page, as it does everywhere (issue #168).
+        if self.dialog.is_none() && !self.own_modal_open() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P)) {
+            self.open_print();
+        }
+        // The page's own zoom from the keyboard, as OneNote has it: Ctrl+Alt with plus, minus or 0
+        // (issue #376). Ctrl alone with them stays egui's size for the whole window (issue #377
+        // keeps the two apart).
+        let page_keys_free = self.dialog.is_none() && !self.own_modal_open() && self.custom_tags.is_none();
+        if page_keys_free {
+            let keys = Modifiers::COMMAND | Modifiers::ALT;
+            let step = ctx.input_mut(|i| {
+                if i.consume_key(keys, Key::Equals) || i.consume_key(keys, Key::Plus) {
+                    Some(1)
+                } else if i.consume_key(keys, Key::Minus) {
+                    Some(-1)
+                } else if i.consume_key(keys, Key::Num0) {
+                    Some(0)
+                } else {
+                    None
+                }
+            });
+            if let Some(step) = step {
+                self.ribbon_act(ribbon::Act::Zoom(step));
+            }
+        }
+        // F11 gives the page the whole window and brings the notebooks back, as in OneNote, so Full
+        // Page View can be left from the keyboard as well as from its button (issue #376).
+        if page_keys_free && self.editor.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F11)) {
+            self.full_page = !self.full_page;
+            self.compact_full_page = false;
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
             if let Some(ed) = self.editor.as_mut() {
@@ -13837,6 +14115,18 @@ fn pick_ocr_models_folder() -> Option<PathBuf> {
 
 #[cfg(target_arch = "wasm32")]
 fn pick_ocr_models_folder() -> Option<PathBuf> {
+    None
+}
+
+/// File > Print asks where to save the PDF (issue #168). Below the other choosers, and gated in
+/// its own right, for the same reason as the ones above. A browser downloads the file instead.
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_pdf_destination(name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title(crate::tl_id!("ui.print_save_as_pdf")).set_file_name(name).add_filter("PDF", &["pdf"]).save_file()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_pdf_destination(_name: &str) -> Option<PathBuf> {
     None
 }
 

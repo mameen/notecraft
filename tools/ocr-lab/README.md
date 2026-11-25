@@ -29,8 +29,23 @@ It prints one line per picture and exits 1 if any picture fails.
 - **Title row.** Drag the bare bar to move the window, double-click it to maximise. The buttons at the
   right close, maximise and minimise. The sun or moon opens the theme chooser (the same 14 themes as
   the app). The light shows the model state.
-- **Left: test cases.** The pictures grouped first by kind (the first folder, such as Handwriting) and
-  then by language (from the folder names). A pencil marks a picture that has labels.
+- **Left: test cases.** The pictures grouped by language (from the folder names), then by how they were
+  made (**Picture (photo or scan)** or **Digital drawing (pen or vector)**), then by what they contain
+  (**Handwriting (text)**, **Handwriting (math)**, **Shapes**, or **Other** when untagged). A sample
+  with several content tags appears under each of them. Every content node has **+ A page here**:
+  **New blank drawing** or **Import picture…**, which put the new sample in `<test folder>/<Language>/`
+  with that node's tags. A pencil marks a picture that has labels.
+- **Delete.** A sample has a 🗑 button, and a right-click menu with **Delete…** and **Show in Explorer**.
+  Deleting asks first, then moves the picture and its label, OCR run and tags into `local\deleted\`, so
+  nothing is erased.
+- **OCR file.** Running OCR writes `<picture>.ocr.json` beside the picture: the text, each line's polygon,
+  the picture's bounds polygon, the picture's hash, and the lab's timings. It is also the saved run, and
+  the only OCR file. It follows the proposed schema in `nc-info-ocr/references/ocr-json-schema.md`.
+  The navigator shows it under its sample. Its `alt` is `null` until a description model exists.
+  When OCR runs, the lab checks that no two line outlines cross, and logs any it finds. Nesting is allowed.
+- **Tags.** Each picture's source and content are in `<picture>.tags.json` beside it, for example
+  `{"source": "drawing", "content": ["shapes"]}`. A picture without the file is a picture with no
+  content tags.
 - **Middle: the picture.** Orange boxes are the engine's lines. Blue boxes are your labels. Yellow is
   the box you have selected.
 - **Right: run and labels.** Run OCR, copy the report, switch between select and draw, and see the
@@ -57,6 +72,33 @@ skill.
   to it to change its box colour.
 - Labels are saved beside each picture as `<picture>.label.json` as soon as you change them.
 
+## Models section
+
+The right panel's **Models** section names the model format (ONNX), the model family (the official
+`ocrs` detection and recognition models), the engine (`ocrs`) and the inference runtime that loads
+the ONNX files (`rten`, pure Rust). It links to their sources, the model repository and the model
+card, and gives the licence. For each model it shows the expected size, what
+the model does, and what it can read. The state line says whether the engine is loaded, and the header
+light's reason is repeated there.
+
+## Drawings
+
+- **New blank drawing** asks for a width and height, with presets (A4 at 150 dpi, whiteboard, square). It
+  writes `drawing-N.png` and an empty `drawing-N.svg` beside it.
+- **Saving a drawing** writes both files. The PNG is what OCR reads. The SVG keeps each stroke with the
+  pen's readings, so the drawing can be edited later. A drawing made before this change has no SVG, so
+  its strokes are not editable.
+- **The Draw ribbon** appears above the picture only for a digital drawing (a sample tagged as a drawing).
+  It is the app's own Draw ribbon: the pen rack (add, remove, move and change pens), with the same tools,
+  colours and widths. Choose a pen and draw on the picture. A highlighter lets the picture show through.
+  The ribbon's page commands (Insert Space, Save picture, Format Background, and so on) say they are not in
+  the lab yet.
+- The picture on screen changes at once, but the file does not until you press **Save drawing**. Until
+  then you cannot open another picture.
+- Pens draw full pressure, since a mouse has none. Undo, more pens, and saving the drawing as the app
+  stores it (SVG with the pen's readings) are not built yet.
+- Saving removes the old OCR run for that picture, so the next **Run OCR** reads the new drawing.
+
 ## Picture sliders
 
 Under **Picture** in the right panel: **Hue**, **Contrast** and **Brightness**, with **Reset picture**.
@@ -64,9 +106,9 @@ They change only the picture on screen, so you can see faint handwriting. OCR re
 
 ## Runs
 
-A run is saved beside its picture as `<picture>.ocr-run.json` with the picture's checksum. Reopening the
-picture shows the last result without reading it again. If the picture file changes, the old run is
-ignored.
+A run is saved beside its picture as `<picture>.ocr.json`, the one OCR file, with the picture's checksum.
+Reopening the picture shows the last result without reading it again. If the picture file changes, the
+old file is ignored. Clearing a result removes the file.
 
 ## Where things live
 
