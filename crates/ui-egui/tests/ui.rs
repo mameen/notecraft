@@ -4954,10 +4954,10 @@ fn a_new_section_button_adds_a_section_to_the_chosen_notebook() {
             .collect();
         assert_eq!(made.len(), 1, "split={split}: one section named Plans was made in the notebook");
         assert_eq!(notecraft_store::tree::child_dirs(&notebook).len(), before + 1, "split={split}: and nothing else");
-        let state = ask(&mut h, "ui.inspect", json!({})).expect("inspect");
-        let chosen: Vec<&Value> =
-            state["rows"].as_array().map(|r| r.iter().filter(|row| row["selected"] == json!(true)).collect()).unwrap_or_default();
-        assert!(chosen.iter().any(|row| row["title"] == json!("Plans")), "split={split}: the new section is the chosen one: {chosen:?}");
+        // The new section is the one chosen: it starts with a page, which is open (issue #570).
+        let open = h.state().current_page().map(std::path::Path::to_path_buf).expect("a page is open");
+        let section = open.parent().and_then(notecraft_store::tree::read_node).map(|n| n.title);
+        assert_eq!(section.as_deref(), Some("Plans"), "split={split}: the page open is in the new section");
     }
 }
 
@@ -15632,11 +15632,13 @@ fn a_row_menu_opens_from_the_keyboard_at_its_row_and_escape_returns() {
         h.step();
         h.key_press_modifiers(modifiers, key);
         settle(&mut h);
+        // Under the row when it fits there, else over it (the page's menu is long): either way
+        // it touches the row, not the pointer's place.
         let new_page = h.get_by_label("New page").rect();
-        assert!(
-            new_page.min.y >= row.min.y - 2.0 && new_page.min.y - row.max.y < 40.0,
-            "{key:?}: the menu opens at its row: {new_page:?} under {row:?}"
-        );
+        let delete = h.get_by_label("Delete...").rect();
+        let below = new_page.min.y >= row.min.y - 2.0 && new_page.min.y - row.max.y < 40.0;
+        let above = delete.max.y <= row.max.y + 2.0 && row.min.y - delete.max.y < 40.0;
+        assert!(below || above, "{key:?}: the menu opens at its row: {new_page:?}..{delete:?} by {row:?}");
         h.key_press(egui::Key::Escape);
         settle(&mut h);
         assert!(h.query_by_label("New page").is_none(), "Escape closes the menu");
@@ -15815,8 +15817,10 @@ fn the_page_and_empty_space_menus_lock_a_page_read_only_and_unlock_it() {
     let blank = egui::pos2(row.center().x, row.max.y + 60.0);
     ask(&mut h, "ui.click", json!({"x": blank.x, "y": blank.y, "button": "right"})).expect("right-click the empty space");
     settle(&mut h);
-    assert_eq!(h.query_all_by_label("Unlock").count(), 1, "the empty-space menu offers the unlock");
-    h.get_by_label("Unlock").click();
+    // It acts on the open page, not on the blank space, so it names that page (issue #380).
+    let unlock = format!("Unlock “{title}”");
+    assert_eq!(h.query_all_by_label(&unlock).count(), 1, "the empty-space menu offers the unlock, naming the page");
+    h.get_by_label(&unlock).click();
     settle(&mut h);
     assert!(!notecraft_store::page::read_only(&s.md_page).expect("read"), "the unlock is written in the page file");
     assert!(writable(&mut h), "the open page takes edits again");
@@ -17234,4 +17238,1153 @@ fn a_click_on_open_paper_puts_the_caret_under_the_pointer() {
         "the caret's line {line:?} is under the click at {at:?}: {}",
         state.pointer("/page/containers").cloned().unwrap_or(Value::Null)
     );
+}
+
+/// The label of the control that has the keyboard, if any.
+fn focused_label(h: &Harness<'_, NoteCraftApp>) -> Option<String> {
+    use egui_kittest::kittest::NodeT as _;
+    h.query_by(|n| n.is_focused()).and_then(|n| n.accesskit_node().label())
+}
+
+/// Issue #380: the page's own menu opens from the keyboard (Shift+F10 or the Menu key) while the
+/// caret is in the page, under the caret's line rather than wherever the pointer was left, with the
+/// keyboard on its first row; the arrows move through it; Escape closes it and the words have the
+/// keyboard again.
+#[test]
+fn the_page_menu_opens_from_the_keyboard_at_the_caret_and_escape_gives_it_back() {
+    let (_t, app, s) = sample_app("ui-page-menu-keys");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    for (modifiers, key) in [(egui::Modifiers::SHIFT, egui::Key::F10), (egui::Modifiers::NONE, egui::Key::Menu)] {
+        ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+        settle(&mut h);
+        let words = h.query_by(|n| n.is_focused()).map(|n| n.rect()).expect("the words have the keyboard");
+        // The pointer is far from the caret, so a menu at the pointer would show up there.
+        h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(1150.0, 700.0)));
+        h.key_press_modifiers(modifiers, key);
+        settle(&mut h);
+        // The menu's Paste, not the ribbon's: the lowest of the two.
+        let paste = h.query_all_by_label("Paste").map(|n| n.rect()).max_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("Paste");
+        assert!(
+            (paste.min.y - words.min.y).abs() < 80.0 && paste.min.x < words.max.x,
+            "{key:?}: the menu opens at the caret's line: {paste:?} by {words:?}"
+        );
+        assert_eq!(h.query_all_by_label("This page").count(), 1, "the menu names what it acts on");
+        assert_eq!(focused_label(&h).as_deref(), Some("Paste"), "{key:?}: the keyboard is on the first row");
+        h.key_press(egui::Key::ArrowDown);
+        settle(&mut h);
+        assert_eq!(focused_label(&h).as_deref(), Some("Cut"), "Down moves to the next row");
+        h.key_press(egui::Key::Escape);
+        settle(&mut h);
+        assert!(h.query_by_label("This page").is_none(), "Escape closes the menu");
+        let back = h.query_by(|n| n.is_focused()).map(|n| n.rect());
+        assert_eq!(back, Some(words), "{key:?}: the words have the keyboard again");
+    }
+}
+
+/// Issue #380: a picture or a box selected on the page opens its own menu from the keyboard, with
+/// the keyboard on the first row; Escape closes the menu and leaves it selected.
+#[test]
+fn a_selected_picture_and_box_open_their_menus_from_the_keyboard() {
+    let (_t, mut app, s) = sample_app("ui-object-menu-keys");
+    let md = s.md_page.to_string_lossy().to_string();
+    app.open_path(&md);
+    let mut h = harness(app, LIGHT);
+    settle(&mut h);
+    ask(&mut h, "engine.execute", json!({"command": "page.save", "params": {"path": md.clone(), "body": "![the koala](assets/koala.png)\n"}}))
+        .expect("write one-picture page");
+    ask(&mut h, "engine.execute", json!({"command": "page.containers", "params": {"path": md.clone(), "boxes": "0,0,300,1"}})).expect("arrange");
+    ask(&mut h, "ui.open", json!({"path": md})).expect("open the picture page");
+    settle(&mut h);
+    let origin = look_at(&mut h).pointer("/page/origin").and_then(Value::as_array).cloned().unwrap_or_default();
+    let ox = origin.first().and_then(Value::as_f64).unwrap_or(0.0);
+    let header = h.query_all_by_label_contains("Add emoji to block").next().expect("the header of the picture block").rect();
+    ask(&mut h, "ui.click", json!({"x": ox + 120.0, "y": header.bottom() as f64 + 16.0})).expect("click the picture");
+    settle(&mut h);
+    assert_eq!(look_at(&mut h).pointer("/page/selectedImage").and_then(Value::as_u64), Some(0), "the picture is selected");
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F10);
+    settle(&mut h);
+    assert!(h.query_by_label("Save picture as...").is_some(), "the picture's menu opens from the keyboard");
+    assert_eq!(h.query_all_by_label("This picture").count(), 1, "and names what it acts on");
+    assert_eq!(focused_label(&h).as_deref(), Some("Save picture as..."), "with the keyboard on its first row");
+    // The arrows move through the menu; they do not move off the picture behind it.
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    assert_eq!(focused_label(&h).as_deref(), Some("Copy Text from Picture"), "Down moves to the next row");
+    assert_eq!(look_at(&mut h).pointer("/page/selectedImage").and_then(Value::as_u64), Some(0), "and the picture stays selected");
+    assert!(h.query_by_label("Save picture as...").is_some(), "with its menu open");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.query_by_label("Save picture as...").is_none(), "Escape closes it");
+    assert_eq!(look_at(&mut h).pointer("/page/selectedImage").and_then(Value::as_u64), Some(0), "and the picture stays selected");
+
+    // A box, picked by its handle.
+    let (_t2, mut h, _blocks, (ox, oy)) = two_boxes("ui-box-menu-keys");
+    let by = bar_y(&mut h, oy);
+    ask(&mut h, "ui.click", json!({"x": ox + 100.0, "y": by})).expect("click the handle");
+    settle(&mut h);
+    assert_eq!(look_at(&mut h).pointer("/page/selectedContainer").and_then(Value::as_u64), Some(0), "the box is selected");
+    h.key_press(egui::Key::Menu);
+    settle(&mut h);
+    assert_eq!(h.query_all_by_label("This box").count(), 1, "the box's menu opens from the keyboard and names its target");
+    assert_eq!(focused_label(&h).as_deref(), Some("Cut"), "with the keyboard on its first row");
+    // Delete is the last row, in a section of its own.
+    let delete = h.query_all_by_label("Delete").map(|n| n.rect()).max_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("Delete");
+    let attach = h.get_by_label("Attach a file").rect();
+    assert!(delete.min.y > attach.max.y, "Delete comes after the page's entries: {delete:?} after {attach:?}");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(h.query_all_by_label("This box").count(), 0, "Escape closes the menu");
+    assert_eq!(look_at(&mut h).pointer("/page/selectedContainer").and_then(Value::as_u64), Some(0), "and the box stays selected");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(look_at(&mut h).pointer("/page/selectedContainer").is_none_or(Value::is_null), "a second Escape lets go of it");
+}
+
+/// Issue #380: a menu opened near the window's right or bottom edge turns to open the other way, so
+/// its last row is inside the window.
+#[test]
+fn a_page_menu_at_the_window_edge_turns_to_stay_inside() {
+    let (_t, app, s) = sample_app("ui-page-menu-edge");
+    let size = egui::vec2(1000.0, 640.0);
+    let mut h = sized_harness(app, LIGHT, size);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    // Just above the status bar, which is not the page.
+    for (x, y) in [(size.x - 30.0, 300.0), (500.0, size.y - 60.0), (size.x - 30.0, size.y - 60.0)] {
+        ask(&mut h, "ui.click", json!({"x": x, "y": y, "button": "right"})).expect("right-click the page");
+        settle(&mut h);
+        for item in ["This page", "Equation", "Attach a file", "Lock read only"] {
+            let r = h.query_by_label(item).unwrap_or_else(|| panic!("at ({x}, {y}): {item} is in the menu")).rect();
+            assert!(r.min.x >= 0.0 && r.max.x <= size.x && r.min.y >= 0.0 && r.max.y <= size.y, "at ({x}, {y}): {item} is inside the window: {r:?}");
+        }
+        h.key_press(egui::Key::Escape);
+        settle(&mut h);
+    }
+}
+
+/// Issue #380: every menu row has one shape. The section's Colour row is a row like the others,
+/// with the others' height and width, and opens its colours from the keyboard; the blank space's
+/// menu uses the same rows and names the page its lock acts on.
+#[test]
+fn menu_rows_share_one_shape_and_a_submenu_opens_from_the_keyboard() {
+    let (_t, app, s) = sample_app("ui-menu-shape");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let section = notecraft_store::tree::read_node(s.md_page.parent().expect("section")).expect("section").title;
+    let row = h.get_all_by_label(&section).map(|n| n.rect()).min_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("section row");
+    h.get_all_by_label(&section).find(|n| n.rect() == row).expect("row").click_secondary();
+    settle(&mut h);
+    let colour = h.get_by_label("Colour").rect();
+    let rename = h.get_by_label("Rename...").rect();
+    assert!((colour.height() - rename.height()).abs() < 0.5 && (colour.width() - rename.width()).abs() < 0.5, "{colour:?} vs {rename:?}");
+    assert!((colour.min.x - rename.min.x).abs() < 0.5, "the rows start in one column");
+    h.get_by_label("Colour").focus();
+    h.step();
+    h.key_press(egui::Key::ArrowRight);
+    settle(&mut h);
+    assert!(h.query_by_label("No colour").is_some(), "Right opens the colours");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+
+    // The navigator's blank space: the same rows, and the lock names the page it acts on.
+    let title = notecraft_store::tree::read_node(&s.md_page).expect("page").title;
+    let page_row = h.get_all_by_label(&title).map(|n| n.rect()).min_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("page row");
+    let blank = egui::pos2(page_row.center().x, page_row.max.y + 60.0);
+    ask(&mut h, "ui.click", json!({"x": blank.x, "y": blank.y, "button": "right"})).expect("right-click the empty space");
+    settle(&mut h);
+    let lock = h.get_by_label(&format!("Lock “{title}” read only")).rect();
+    let new_notebook = h.get_by_label("New notebook...").rect();
+    assert!((lock.height() - new_notebook.height()).abs() < 0.5 && (lock.min.x - new_notebook.min.x).abs() < 0.5, "{lock:?} vs {new_notebook:?}");
+}
+
+/// Issue #374: Pictures is two buttons in one, as in Office: the picture inserts from a file at
+/// once, and "Pictures options" opens the list of sources. The list opens from the keyboard with
+/// the keyboard on its first source, has a title, and Escape gives the keyboard back.
+#[test]
+fn pictures_splits_its_action_from_its_list_and_escape_returns_to_it() {
+    let (_t, app, s) = sample_app("ui-pictures-split");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("Insert").click();
+    settle(&mut h);
+    let main = h.get_by_label("Pictures").rect();
+    let options = h.get_by_label("Pictures options").rect();
+    assert!(
+        main.max.y <= options.min.y + 0.5 && (main.center().x - options.center().x).abs() < 1.0,
+        "action above, list below: {main:?} {options:?}"
+    );
+    h.get_by_label("Pictures options").focus();
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert!(h.query_by_label("Insert a picture from").is_some(), "the list has a title");
+    assert_eq!(focused_label(&h).as_deref(), Some("Picture from a file"), "the keyboard is on the first source");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.query_by_label("Picture from a file").is_none(), "Escape closes the list");
+    assert_eq!(focused_label(&h).as_deref(), Some("Pictures options"), "and gives the keyboard back to the part that opened it");
+}
+
+/// Issue #374: Equation and Symbol open from the keyboard with the keyboard on their first choice,
+/// and Escape gives it back to the button.
+#[test]
+fn equation_and_symbol_pickers_take_the_keyboard_and_escape_gives_it_back() {
+    let (_t, app, s) = sample_app("ui-insert-pickers-keys");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 760.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("Insert").click();
+    settle(&mut h);
+    h.get_by_label("Equation").focus();
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert!(h.query_by_label("Start from an equation").is_some(), "the equations have a title");
+    assert!(focused_label(&h).is_some_and(|l| l.contains("Fraction")), "the keyboard is on the first equation: {:?}", focused_label(&h));
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.query_by_label("Start from an equation").is_none(), "Escape closes the list");
+    assert_eq!(focused_label(&h).as_deref(), Some("Equation"), "and the Equation button has the keyboard");
+
+    h.get_by_label("Symbol").focus();
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert_eq!(focused_label(&h).as_deref(), Some("©"), "the keyboard is on the first symbol");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.query_by_label("©").is_none(), "Escape closes the picker");
+    assert_eq!(focused_label(&h).as_deref(), Some("Symbol"), "and the Symbol button has the keyboard");
+}
+
+/// Issue #373: with nothing to format (a locked page) Home's text controls are shown as
+/// unavailable, not as ready; with the page open for editing they are live, and the font box says
+/// Default rather than a font's name when the words use the page's own.
+#[test]
+fn home_text_controls_are_unavailable_without_words_to_format() {
+    use egui_kittest::kittest::NodeT as _;
+    let (_t, app, s) = sample_app("ui-home-unavailable");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let disabled = |h: &Harness<'_, NoteCraftApp>, label: &str| h.get_by_label(label).accesskit_node().is_disabled();
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    for label in ["Bold", "Italic", "Underline", "Bullets", "Font Family", "Font Size", "Font Colour"] {
+        assert!(!disabled(&h, label), "{label} is live with the caret in the words");
+    }
+    assert_eq!(h.get_by_label("Font Family").value().as_deref(), Some("Default"), "the page's own font reads Default");
+
+    notecraft_store::page::set_read_only(&s.md_page, true).expect("lock");
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    for label in ["Bold", "Italic", "Underline", "Bullets", "Font Family", "Font Size", "Font Colour"] {
+        assert!(disabled(&h, label), "{label} is unavailable on a locked page");
+    }
+}
+
+/// Issue #373: the Styles gallery opens from the keyboard on the style the caret is in, and
+/// Escape gives the keyboard back to its More button; Page and Paragraph name their rows.
+#[test]
+fn the_styles_gallery_opens_from_the_keyboard_on_the_current_style() {
+    let (_t, app, s) = sample_app("ui-styles-keys");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 760.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    h.get_by_label("More styles").focus();
+    h.step();
+    h.step();
+    assert_eq!(focused_label(&h).as_deref(), Some("More styles"), "the keyboard is on More styles");
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    let focused = focused_label(&h).expect("a style row has the keyboard");
+    let styles = ["Heading 1", "Heading 2", "Heading 3", "Heading 4", "Heading 5", "Heading 6", "Page Title", "Citation", "Quote", "Code", "Normal"];
+    assert!(styles.contains(&focused.as_str()), "a style has the keyboard: {focused}");
+    let on = |n: &egui_kittest::Node<'_>| {
+        use egui_kittest::kittest::NodeT as _;
+        n.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+    };
+    assert!(h.query_all_by_label(&focused).any(|n| on(&n)), "and it is the style the caret is in");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(focused_label(&h).as_deref(), Some("More styles"), "Escape gives the keyboard back to More styles");
+    assert!(h.query_by_label("Page").is_some() && h.query_by_label("Paragraph").is_some(), "the direction rows say what they change");
+}
+
+/// Review of #510: the marks act with no caret, as the font boxes do. A caret is placed at the end
+/// of the page's last words, and the next words typed there take the mark.
+#[test]
+fn bold_with_no_caret_applies_to_the_next_words_typed() {
+    let (_t, app, s) = sample_app("ui-bold-no-caret");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    assert!(look_at(&mut h).pointer("/page/caret").is_none_or(Value::is_null), "no caret to begin with");
+    h.get_by_label("Bold").click();
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "boldwords"})).expect("type");
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    assert!(body.contains("**boldwords**"), "the words typed after Bold are bold:\n{body}");
+}
+
+/// Review of #510: a page menu opened from the keyboard and closed by a click on another control
+/// leaves the keyboard with that control, not with the words the menu came from.
+#[test]
+fn a_click_outside_the_keyboard_page_menu_keeps_the_keyboard_where_it_landed() {
+    let (_t, app, s) = sample_app("ui-page-menu-click-away");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F10);
+    settle(&mut h);
+    assert!(h.query_by_label("This page").is_some(), "the menu is open");
+    let search = h
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .map(|n| n.rect())
+        .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
+        .expect("the search box in the title bar");
+    ask(&mut h, "ui.click", json!({"x": search.center().x, "y": search.center().y})).expect("click the search box");
+    settle(&mut h);
+    assert!(h.query_by_label("This page").is_none(), "the click closes the menu");
+    ask(&mut h, "ui.text", json!({"text": "findneedle"})).expect("type");
+    settle(&mut h);
+    assert!(!h.state().body().unwrap_or_default().contains("findneedle"), "nothing typed went into the page");
+    assert!(
+        h.get_all_by_role(egui::accesskit::Role::TextInput).any(|n| n.value().as_deref() == Some("findneedle")),
+        "the typing went to the search box the click landed on"
+    );
+}
+
+/// Review of #510: Code with no caret wraps nothing at the end of the page's last words, and the
+/// caret goes between the marks, so the next words typed are code.
+#[test]
+fn code_with_no_caret_puts_the_next_words_typed_inside_its_marks() {
+    let (_t, app, s) = sample_app("ui-code-no-caret");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("Code").click();
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "codewords"})).expect("type");
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    assert!(body.contains("`codewords`"), "the words typed after Code are code:\n{body}");
+}
+
+/// The same folder, however it is spelled (Windows can add `\\?\`).
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
+}
+
+/// The page shown, canonical.
+fn shown_page(h: &Harness<'_, NoteCraftApp>) -> Option<PathBuf> {
+    h.state().current_page().and_then(|p| std::fs::canonicalize(p).ok())
+}
+
+/// Clicks the topmost row (or tab) named `title`.
+fn click_named(h: &mut Harness<'_, NoteCraftApp>, title: &str) {
+    let at = h.get_all_by_label(title).map(|n| n.rect()).min_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("a row of that name");
+    ask(h, "ui.click", json!({"x": at.center().x, "y": at.center().y})).expect("click the row");
+    settle(h);
+}
+
+/// Issues #525 and #557: choosing a section in the notebooks opens a page there in one step, the
+/// page last open in it when it was visited before, and an empty section shows its own empty
+/// state, not the page of the section left.
+#[test]
+fn choosing_a_section_opens_its_page_and_remembers_where_it_was_left() {
+    let (_t, app, s) = sample_app("ui-section-opens");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("Expand Work").click();
+    settle(&mut h);
+    click_named(&mut h, "Projects");
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    assert_eq!(shown_page(&h), canon(&s.html_page), "the section's first page is open");
+    assert_eq!(look_at(&mut h).pointer("/page/title").and_then(Value::as_str), Some("Project X"), "and the canvas shows it");
+    // Another page of Projects, then away and back: it opens where it was left.
+    h.state_mut().open_path(&s.deep_page.to_string_lossy());
+    settle(&mut h);
+    click_named(&mut h, "Ideas");
+    assert_eq!(shown_page(&h), canon(&s.md_page));
+    click_named(&mut h, "Projects");
+    assert_eq!(shown_page(&h), canon(&s.deep_page), "Projects opens at the page last open there");
+
+    // An empty section: the page is closed and the section says it has none.
+    let empty = ask(
+        &mut h,
+        "engine.execute",
+        json!({"command": "node.create", "params": {"parent": s.notebook.to_string_lossy(), "kind": "section", "title": "Empty"}}),
+    )
+    .expect("an empty section");
+    let _ = empty;
+    settle(&mut h);
+    click_named(&mut h, "Empty");
+    assert!(h.state().current_page().is_none(), "no page from another section is left on the canvas");
+    assert!(h.query_by_label("No pages in this section yet.").is_some(), "the canvas says the section is empty");
+    h.get_by_label("Add the first page").click();
+    settle(&mut h);
+    let page = h.state().current_page().map(std::path::Path::to_path_buf).expect("a page was made and opened");
+    assert_eq!(notecraft_store::tree::read_node(page.parent().expect("parent")).map(|n| n.title).as_deref(), Some("Empty"), "in the empty section");
+}
+
+/// Issue #570: a new section starts with a page, opened, so it is ready to write in.
+#[test]
+fn a_new_section_starts_with_an_open_page() {
+    let (_t, app, s) = sample_app("ui-new-section-page");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("+ New section").click();
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "Plans"})).expect("name");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Enter"})).expect("Enter");
+    settle(&mut h);
+    let section = notecraft_store::tree::child_dirs(&s.notebook)
+        .into_iter()
+        .find(|d| notecraft_store::tree::read_node(d).is_some_and(|n| n.title == "Plans"))
+        .expect("the section");
+    let pages: Vec<_> = notecraft_store::tree::child_dirs(&section).into_iter().filter(|d| notecraft_store::tree::page_file(d).is_some()).collect();
+    assert_eq!(pages.len(), 1, "the new section has one page");
+    assert!(shown_page(&h).is_some_and(|p| same_dir(&p, &pages[0])), "and that page is open");
+}
+
+/// Issues #512 and #513: Ctrl+Tab and Ctrl+Shift+Tab go round the notebook's sections in their
+/// order, and Alt+Home and Alt+End go to the first and last page of the section's list, without
+/// writing anything into the page.
+#[test]
+fn ctrl_tab_goes_between_sections_and_alt_home_end_between_pages() {
+    let (_t, app, s) = sample_app("ui-section-keys");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret in the words");
+    settle(&mut h);
+    let on_disk = |p: &std::path::Path| notecraft_store::page::load_page(p).map(|p| p.body).unwrap_or_default();
+    let before = on_disk(&s.md_page);
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    // Ideas is the last section: Ctrl+Tab goes round to Projects, the first (inside Work).
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Tab);
+    settle(&mut h);
+    assert_eq!(shown_page(&h), canon(&s.html_page), "Ctrl+Tab: the next section, round from the last");
+    assert_eq!(on_disk(&s.md_page), before, "nothing was typed into the page left");
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Tab);
+    settle(&mut h);
+    assert_eq!(shown_page(&h), canon(&s.md_page), "Ctrl+Shift+Tab: back to Ideas");
+
+    // Projects lists Project X and Deep page; Deep page's subpages are folded away.
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::End);
+    settle(&mut h);
+    assert_eq!(shown_page(&h), canon(&s.deep_page), "Alt+End: the last page on the list");
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::Home);
+    settle(&mut h);
+    assert_eq!(shown_page(&h), canon(&s.html_page), "Alt+Home: the first");
+    // With the subpages shown, the last page is the deepest one.
+    h.get_by_label("Expand Deep page").click();
+    settle(&mut h);
+    for _ in 0..8 {
+        let more = h.query_all_by_label_contains("Expand Level").next().map(|n| n.rect());
+        let Some(r) = more else { break };
+        ask(&mut h, "ui.click", json!({"x": r.center().x, "y": r.center().y})).expect("expand");
+        settle(&mut h);
+    }
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::End);
+    settle(&mut h);
+    let last = h.state().current_page().and_then(notecraft_store::tree::read_node).map(|n| n.title).unwrap_or_default();
+    assert!(last.starts_with("Level"), "with the subpages listed, Alt+End reaches the last of them: {last}");
+}
+
+/// Issue #558: Ctrl+T opens New section for the notebook or the section group the open section is
+/// in; cancelled, the page stays as it was.
+#[test]
+fn ctrl_t_asks_for_a_new_section_where_the_open_section_is() {
+    let (_t, app, s) = sample_app("ui-ctrl-t");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    let before = h.state().body().unwrap_or_default().to_string();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+    settle(&mut h);
+    assert!(h.query_by_label("Cancel").is_some(), "the New section dialog is open");
+    h.get_by_label("Cancel").click();
+    settle(&mut h);
+    assert!(shown_page(&h).is_some_and(|p| same_dir(&p, &s.md_page)), "cancelled, the page is as it was");
+    assert_eq!(h.state().body().unwrap_or_default(), before);
+
+    // From a page in the Work group, the new section goes in the group.
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "Later"})).expect("name");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Enter"})).expect("Enter");
+    settle(&mut h);
+    let group = s.html_page.parent().and_then(std::path::Path::parent).expect("the Work group");
+    assert!(
+        notecraft_store::tree::child_dirs(group).iter().any(|d| notecraft_store::tree::read_node(d).is_some_and(|n| n.title == "Later")),
+        "the section was made in the group"
+    );
+}
+
+/// Issue #571: Ctrl+Shift+T puts the keyboard in the page's title without changing it, and
+/// Escape gives it back to the words. A hidden title or a locked page says why it cannot.
+#[test]
+fn ctrl_shift_t_goes_to_the_title_and_escape_comes_back() {
+    let (_t, app, s) = sample_app("ui-ctrl-shift-t");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    let words = focused_label(&h);
+    let before = h.state().body().unwrap_or_default().to_string();
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::T);
+    settle(&mut h);
+    assert_eq!(focused_label(&h).as_deref(), Some("Title"), "the title has the keyboard");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(focused_label(&h), words, "Escape gives the keyboard back to the words");
+    assert_eq!(h.state().body().unwrap_or_default(), before, "nothing changed");
+    assert_eq!(look_at(&mut h).pointer("/page/title").and_then(Value::as_str), Some("Format ideas"));
+
+    h.get_by_label("View").click();
+    settle(&mut h);
+    h.get_by_label("Hide page title").click();
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::T);
+    settle(&mut h);
+    assert!(h.state().status().contains("hidden"), "a hidden title says so: {}", h.state().status());
+}
+
+/// Issues #561 and #562: Alt+Shift+D, T and F write the ribbon's time stamps at the caret, and
+/// Ctrl+Alt+1 to 6 set the heading styles, with one Undo each. A locked page is left alone, and so
+/// is the page while another text box has the keyboard.
+#[test]
+fn stamp_and_heading_keys_act_as_the_ribbon_does() {
+    let (_t, app, s) = sample_app("ui-stamp-heading-keys");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 900.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    // The ribbon's Date, for comparison.
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    let original = h.state().body().unwrap_or_default().to_string();
+    h.get_by_label("Insert").click();
+    settle(&mut h);
+    h.get_by_label("Date").click();
+    settle(&mut h);
+    let by_ribbon = h.state().body().unwrap_or_default().to_string();
+    assert_ne!(by_ribbon, original, "the ribbon wrote a date");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+    assert_eq!(h.state().body().unwrap_or_default(), original, "undone");
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::D);
+    settle(&mut h);
+    assert_eq!(h.state().body().unwrap_or_default(), by_ribbon, "Alt+Shift+D writes what the ribbon's Date writes");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+    assert_eq!(h.state().body().unwrap_or_default(), original, "one Undo takes it back");
+
+    // Ctrl+Alt+2: the paragraph with the caret becomes Heading 2.
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::ALT, egui::Key::Num2);
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    assert!(body.contains("## NoteCraft pages are"), "the paragraph is a Heading 2:\n{body}");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+    assert_eq!(h.state().body().unwrap_or_default(), original, "one Undo takes it back");
+
+    // The search box has the keyboard: the page is not changed.
+    ask(&mut h, "ui.key", json!({"key": "F", "ctrl": true})).expect("search");
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::ALT, egui::Key::Num1);
+    h.key_press_modifiers(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::T);
+    settle(&mut h);
+    assert_eq!(h.state().body().unwrap_or_default(), original, "nothing changed in the page while the search box had the keyboard");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+
+    // A locked page: nothing is written, and the status says why.
+    let on_disk = |p: &std::path::Path| notecraft_store::page::load_page(p).map(|p| p.body).unwrap_or_default();
+    notecraft_store::page::set_read_only(&s.md_page, true).expect("lock");
+    let locked_body = on_disk(&s.md_page);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::F);
+    settle(&mut h);
+    assert_eq!(on_disk(&s.md_page), locked_body, "the locked page is unchanged");
+    assert!(h.state().status().contains("locked"), "and the status says it is locked: {}", h.state().status());
+}
+
+/// Issue #514: Ctrl+Shift+G and Ctrl+Alt+G give the keyboard to the open section's and page's
+/// rows, bringing the notebooks back from Full Page View, and change nothing in the page.
+#[test]
+fn ctrl_shift_g_and_ctrl_alt_g_go_to_the_section_and_page_rows() {
+    let (_t, app, s) = sample_app("ui-nav-focus-keys");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    let before = h.state().body().unwrap_or_default().to_string();
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::G);
+    settle(&mut h);
+    assert_eq!(focused_label(&h).as_deref(), Some("Ideas"), "the section's row has the keyboard");
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::ALT, egui::Key::G);
+    settle(&mut h);
+    assert_eq!(focused_label(&h).as_deref(), Some("Format ideas"), "the page's row has the keyboard");
+    assert_eq!(h.state().body().unwrap_or_default(), before, "nothing was written into the page");
+    // From Full Page View the notebooks come back for it.
+    h.key_press(egui::Key::F11);
+    settle(&mut h);
+    assert!(h.state().is_full_page(), "Full Page View is on");
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::ALT, egui::Key::G);
+    settle(&mut h);
+    assert!(!h.state().is_full_page(), "the notebooks are back");
+    assert_eq!(focused_label(&h).as_deref(), Some("Format ideas"), "with the page's row focused");
+}
+
+/// Issue #559: Ctrl+G lists the open notebooks with the keyboard on the one open; Down and Enter
+/// switch to another, and Escape changes nothing.
+#[test]
+fn ctrl_g_switches_notebooks_from_the_keyboard() {
+    let (_t, app, s) = sample_app("ui-ctrl-g");
+    let mut h = harness(app, LIGHT);
+    let other = ask(&mut h, "engine.execute", json!({"command": "notebook.create", "params": {"name": "Second"}})).expect("a second notebook");
+    let other = PathBuf::from(other.pointer("/path").and_then(Value::as_str).or(other.as_str()).unwrap_or_default());
+    let section = ask(
+        &mut h,
+        "engine.execute",
+        json!({"command": "node.create", "params": {"parent": other.to_string_lossy(), "kind": "section", "title": "Inbox"}}),
+    )
+    .expect("a section");
+    let section = PathBuf::from(section.pointer("/path").and_then(Value::as_str).or(section.as_str()).unwrap_or_default());
+    let page = ask(
+        &mut h,
+        "engine.execute",
+        json!({"command": "node.create", "params": {"parent": section.to_string_lossy(), "kind": "page", "title": "Hello"}}),
+    )
+    .expect("a page");
+    let page = PathBuf::from(page.pointer("/path").and_then(Value::as_str).or(page.as_str()).unwrap_or_default());
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let notebook = notecraft_store::tree::read_node(&s.notebook).map(|n| n.title).unwrap_or_default();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::G);
+    settle(&mut h);
+    assert_eq!(focused_label(&h).as_deref(), Some(notebook.as_str()), "the open notebook has the keyboard");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.query_by_label("Switch notebook").is_none(), "Escape closes the list");
+    assert!(shown_page(&h).is_some_and(|p| same_dir(&p, &s.md_page)), "and nothing changed");
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::G);
+    settle(&mut h);
+    // The list's row, not the notebook's row in the pane at the left.
+    let rows: Vec<egui::Rect> = h.get_all_by_label("Second").map(|n| n.rect()).collect();
+    let in_list = rows.iter().copied().max_by(|a, b| a.min.x.total_cmp(&b.min.x)).expect("Second in the list");
+    h.get_all_by_label("Second").find(|n| n.rect() == in_list).expect("row").focus();
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    let _ = &page;
+    let opened = shown_page(&h).expect("a page");
+    assert!(opened.starts_with(std::fs::canonicalize(&other).unwrap_or_default()), "Enter opens the notebook chosen, at a page: {opened:?}");
+}
+
+/// From review of issues #559 and #511: a notebook comes back at the page left in it even when
+/// that page's section already remembered it; a notebook with no pages closes the page that was
+/// open; and Ctrl+T with an empty section group chosen makes the section in that group.
+#[test]
+fn notebooks_come_back_where_left_and_ctrl_t_follows_the_chosen_group() {
+    let (_t, app, s) = sample_app("ui-notebook-left");
+    let mut h = harness(app, LIGHT);
+    let made = |h: &mut Harness<'_, NoteCraftApp>, command: &str, params: Value| -> PathBuf {
+        let out = ask(h, "engine.execute", json!({"command": command, "params": params})).expect(command);
+        PathBuf::from(out.pointer("/path").and_then(Value::as_str).or(out.as_str()).unwrap_or_default())
+    };
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    let switch_to = |h: &mut Harness<'_, NoteCraftApp>, name: &str| {
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::G);
+        settle(h);
+        let rows: Vec<egui::Rect> = h.get_all_by_label(name).map(|n| n.rect()).collect();
+        let in_list = rows.iter().copied().max_by(|a, b| a.min.x.total_cmp(&b.min.x)).expect("the notebook in the list");
+        h.get_all_by_label(name).find(|n| n.rect() == in_list).expect("row").focus();
+        h.step();
+        h.key_press(egui::Key::Enter);
+        settle(h);
+    };
+    let notebook = notecraft_store::tree::read_node(&s.notebook).map(|n| n.title).unwrap_or_default();
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    // Back to Ideas, which already remembers its page: the notebook must remember it too.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Tab);
+    settle(&mut h);
+    assert_eq!(shown_page(&h), canon(&s.md_page), "Ctrl+Tab went to Ideas");
+    let other = made(&mut h, "notebook.create", json!({"name": "Second"}));
+    let section = made(&mut h, "node.create", json!({"parent": other.to_string_lossy(), "kind": "section", "title": "Inbox"}));
+    let page = made(&mut h, "node.create", json!({"parent": section.to_string_lossy(), "kind": "page", "title": "Hello"}));
+    h.state_mut().open_path(&page.to_string_lossy());
+    settle(&mut h);
+    switch_to(&mut h, &notebook);
+    assert_eq!(shown_page(&h), canon(&s.md_page), "the notebook came back at the page left in it");
+
+    // A notebook with nothing in it: the page is closed rather than left showing.
+    let bare = made(&mut h, "notebook.create", json!({"name": "Bare"}));
+    for child in notecraft_store::tree::child_dirs(&bare) {
+        ask(&mut h, "engine.execute", json!({"command": "node.delete", "params": {"path": child.to_string_lossy()}})).expect("empty it");
+    }
+    settle(&mut h);
+    switch_to(&mut h, "Bare");
+    assert_eq!(shown_page(&h), None, "no other notebook's page is left showing");
+    assert!(h.state().body().is_none(), "the editor is closed");
+
+    // An empty section group chosen in the pane takes the new section.
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let group = made(&mut h, "node.create", json!({"parent": s.notebook.to_string_lossy(), "kind": "section-group", "title": "Shelf"}));
+    settle(&mut h);
+    click_named(&mut h, "Shelf");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "Old"})).expect("name");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "Enter"})).expect("Enter");
+    settle(&mut h);
+    assert!(
+        notecraft_store::tree::child_dirs(&group).iter().any(|d| notecraft_store::tree::read_node(d).is_some_and(|n| n.title == "Old")),
+        "the section was made in the chosen group"
+    );
+}
+
+/// Issues #518, #531 and #556: a section's and a notebook's menus copy a link named for them,
+/// which opens that section or notebook at a page, even with two notebooks of one name; and a
+/// section's tab in the Tabs layout has the section's own menu.
+#[test]
+fn sections_and_notebooks_copy_links_and_a_tab_has_the_section_menu() {
+    let board = MemoryBoard::new();
+    let (_t, app, s) = sample_app("ui-node-links");
+    let app = app.with_clipboard(Box::new(board.clone()));
+    let mut h = harness(app, LIGHT);
+    let title = notecraft_store::tree::read_node(&s.notebook).map(|n| n.title).unwrap_or_default();
+    // A second notebook with the same name, holding one section and page.
+    let twin = ask(&mut h, "engine.execute", json!({"command": "notebook.create", "params": {"name": title.clone()}})).expect("twin");
+    let twin = PathBuf::from(twin.pointer("/path").and_then(Value::as_str).or(twin.as_str()).unwrap_or_default());
+    let section = ask(
+        &mut h,
+        "engine.execute",
+        json!({"command": "node.create", "params": {"parent": twin.to_string_lossy(), "kind": "section", "title": "Twin section"}}),
+    )
+    .expect("section");
+    let section = PathBuf::from(section.pointer("/path").and_then(Value::as_str).or(section.as_str()).unwrap_or_default());
+    let page = ask(
+        &mut h,
+        "engine.execute",
+        json!({"command": "node.create", "params": {"parent": section.to_string_lossy(), "kind": "page", "title": "Twin page"}}),
+    )
+    .expect("page");
+    let page = PathBuf::from(page.pointer("/path").and_then(Value::as_str).or(page.as_str()).unwrap_or_default());
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+
+    let copied = |h: &mut Harness<'_, NoteCraftApp>| {
+        for _ in 0..8 {
+            pump(h);
+            forward_copies(h, &board);
+        }
+        let text = board.read_text();
+        text.rsplit_once('(').and_then(|(_, r)| r.strip_suffix(')')).map(str::to_owned).unwrap_or_default()
+    };
+    // The section's menu, from its row.
+    let row = h.get_all_by_label("Ideas").map(|n| n.rect()).min_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("Ideas");
+    h.get_all_by_label("Ideas").find(|n| n.rect() == row).expect("row").click_secondary();
+    settle(&mut h);
+    h.get_by_label("Copy link to section").click();
+    let section_link = copied(&mut h);
+    assert!(section_link.starts_with("notecraft:"), "a section link: {section_link:?}");
+    // The twin notebook's menu.
+    let rows: Vec<egui::Rect> = h.get_all_by_label(&title).map(|n| n.rect()).collect();
+    let lowest = rows.iter().copied().max_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("twin row");
+    h.get_all_by_label(&title).find(|n| n.rect() == lowest).expect("row").click_secondary();
+    settle(&mut h);
+    h.get_by_label("Copy link to notebook").click();
+    let notebook_link = copied(&mut h);
+    assert!(notebook_link.starts_with("notecraft:") && notebook_link != section_link, "a notebook link: {notebook_link:?}");
+
+    // Followed from a page elsewhere, each opens its own place.
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    let ctx = h.ctx.clone();
+    h.state_mut().follow_link(&ctx, &section_link);
+    settle(&mut h);
+    assert!(shown_page(&h).is_some_and(|p| same_dir(&p, &s.md_page)), "the section link opened Ideas at its page");
+    let (lowest_is_twin, ctx) = (notecraft_store::tree::read_node(&twin).is_some(), h.ctx.clone());
+    assert!(lowest_is_twin);
+    h.state_mut().follow_link(&ctx, &notebook_link);
+    settle(&mut h);
+    let opened = shown_page(&h).expect("a page");
+    let _ = &page;
+    assert!(opened.starts_with(std::fs::canonicalize(&twin).unwrap_or_default()), "the twin notebook of the same name was opened: {opened:?}");
+
+    // The Tabs layout: a section tab's own menu acts on that section.
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.get_by_label("View").click();
+    settle(&mut h);
+    h.get_by_label("Tabs layout").click();
+    settle(&mut h);
+    let tab = h.get_all_by_label("Ideas").map(|n| n.rect()).min_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("the Ideas tab");
+    h.get_all_by_label("Ideas").find(|n| n.rect() == tab).expect("tab").click_secondary();
+    settle(&mut h);
+    assert!(h.query_by_label("Copy link to section").is_some(), "the tab has the section's menu");
+    assert!(h.query_by_label("Rename...").is_some(), "with its own actions");
+}
+
+/// Issue #535: Ctrl+Shift+V, and Paste options > Keep text only, paste the clipboard's text alone
+/// in place of the words picked: its lines stay lines, the source's formatting and links stay
+/// behind, and one Undo takes it back. Ctrl+V still pastes with the formatting.
+#[test]
+fn ctrl_shift_v_pastes_the_text_only() {
+    use notecraft_ui_egui::clipboard::Board as _;
+    let board = MemoryBoard::new();
+    let (_t, app, s) = sample_app("ui-paste-plain");
+    let app = app.with_clipboard(Box::new(board.clone()));
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let original = h.state().body().unwrap_or_default().to_string();
+    let rich = "<p><b style=\"color:red\">Rich</b> <a href=\"https://link.test\">words</a></p><p>Second line</p>";
+    board.clone().set_html(rich, "Rich words\nSecond line").expect("clipboard");
+
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    // Ctrl+A picks the paragraph's words.
+    ask(&mut h, "ui.key", json!({"key": "A", "ctrl": true})).expect("select the paragraph");
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::V);
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    assert!(body.contains("\n\nRich words\n\nSecond line"), "the two lines, as paragraphs, in place of the words picked:\n{body}");
+    assert!(!body.contains("NoteCraft pages are **plain"), "the picked words were replaced:\n{body}");
+    assert!(!body.contains("link.test") && !body.contains("**Rich**"), "no link or formatting came with it:\n{body}");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+    assert_eq!(h.state().body().unwrap_or_default(), original, "one Undo takes it back");
+
+    // The ribbon's Paste options: Keep text only does the same; Paste keeps the formatting.
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    h.get_by_label("Paste options").click();
+    settle(&mut h);
+    assert!(h.query_by_label("How to paste").is_some(), "the options have a title");
+    h.get_by_label("Keep text only").click();
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    assert!(body.contains("Rich words") && !body.contains("link.test"), "Keep text only pasted the text:\n{body}");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    let paste = h.get_all_by_label("Paste").map(|n| n.rect()).min_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("Paste");
+    ask(&mut h, "ui.click", json!({"x": paste.center().x, "y": paste.center().y})).expect("click Paste");
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    assert!(body.contains("link.test"), "Paste keeps the link:\n{body}");
+}
+
+/// Issue #535, from review: the text only is the text as written. Stars, brackets and backticks
+/// stay words, in the line the caret is in and in the lines after it; words picked across
+/// paragraphs are replaced; an empty page takes the text; and the native window's Ctrl+Shift+V,
+/// queued before egui sees it, pastes the text only too.
+#[test]
+fn the_text_only_paste_keeps_markup_as_words() {
+    use notecraft_ui_egui::clipboard::Board as _;
+    let words = |body: &str| -> Vec<String> {
+        notecraft_formats::markdown::parse(body)
+            .iter()
+            .filter_map(|b| match b {
+                notecraft_formats::Block::Paragraph(spans, _) => Some(spans.iter().map(|s| s.text.as_str()).collect::<String>()),
+                _ => None,
+            })
+            .collect()
+    };
+    let spans_plain = |body: &str, text: &str| -> bool {
+        notecraft_formats::markdown::parse(body).iter().any(|b| match b {
+            notecraft_formats::Block::Paragraph(spans, _) => {
+                spans.iter().map(|s| s.text.as_str()).collect::<String>().contains(text)
+                    && spans.iter().all(|s| !s.bold && s.link.is_none() && !s.code)
+            }
+            _ => false,
+        })
+    };
+    let board = MemoryBoard::new();
+    let (_t, app, s) = sample_app("ui-paste-plain-literal");
+    let app = app.with_clipboard(Box::new(board.clone()));
+    let mut h = harness(app, LIGHT);
+    let literal = page_of(&mut h, &s, "Literal", "Start end\n\nSecond paragraph here\n\nThird one");
+    board.clone().set_text("**one** [a](b.test)\nmiddle `code`\nlast *line*").expect("clipboard");
+    ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+    settle(&mut h);
+    // Between "Start " and "end".
+    ask(&mut h, "ui.key", json!({"key": "Home"})).expect("Home");
+    for _ in 0.."Start ".len() {
+        ask(&mut h, "ui.key", json!({"key": "ArrowRight"})).expect("right");
+    }
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::V);
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    let lines = words(&body);
+    assert!(lines.iter().any(|l| l == "Start **one** [a](b.test)"), "the first line is literal, at the caret:\n{body}\n{lines:?}");
+    assert!(lines.iter().any(|l| l == "middle `code`"), "a middle line is literal:\n{body}\n{lines:?}");
+    assert!(lines.iter().any(|l| l == "last *line*end"), "the last line is literal and takes what followed the caret:\n{body}\n{lines:?}");
+    assert!(spans_plain(&body, "Start **one**") && spans_plain(&body, "last *line*"), "no formatting was read in it:\n{body}");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+
+    // Words picked across two paragraphs are replaced by the text. The page is opened afresh,
+    // so no line is a text box.
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    h.state_mut().open_path(&literal);
+    settle(&mut h);
+    board.clone().set_text("*in* place").expect("clipboard");
+    let first = h.get_by_label("Start end").rect();
+    let second = h.get_by_label("Second paragraph here").rect();
+    ask(&mut h, "ui.press", json!({"x": first.center().x, "y": first.center().y})).expect("press");
+    settle(&mut h);
+    ask(&mut h, "ui.move", json!({"x": second.center().x, "y": second.center().y})).expect("drag");
+    settle(&mut h);
+    ask(&mut h, "ui.release", json!({"x": second.center().x, "y": second.center().y})).expect("release");
+    settle(&mut h);
+    let open = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/across").cloned().unwrap_or(Value::Null);
+    assert!(!open.is_null(), "a selection across the paragraphs is open");
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::V);
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    let lines = words(&body);
+    assert_eq!(lines.len(), 2, "the two paragraphs picked became one:\n{body}\n{lines:?}");
+    assert!(lines[0].contains("*in* place") && !body.contains("Second paragraph here"), "the picked words were replaced:\n{body}\n{lines:?}");
+    assert_eq!(lines[1], "Third one");
+    let open = ask(&mut h, "ui.inspect", json!({})).expect("inspect").pointer("/page/across").cloned().unwrap_or(Value::Null);
+    assert!(open.is_null(), "the selection is gone");
+
+    // An empty page takes the text in a line of its own.
+    page_of(&mut h, &s, "Empty", "");
+    board.clone().set_text("**fresh**").expect("clipboard");
+    h.state_mut().queue_keyboard_paste_plain();
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    assert!(words(&body).iter().any(|l| l == "**fresh**"), "the native Ctrl+Shift+V pasted the text only on the empty page:\n{body}");
+}
+
+/// From review of #584: words picked across paragraphs and replaced by a text-only paste, or cut,
+/// take their paragraphs out of the page, and a table after them keeps its column widths.
+#[test]
+fn a_selection_across_paragraphs_replaced_or_cut_keeps_the_table_widths() {
+    use notecraft_ui_egui::clipboard::Board as _;
+    let board = MemoryBoard::new();
+    let (_t, app, s) = sample_app("ui-paste-across-widths");
+    let app = app.with_clipboard(Box::new(board.clone()));
+    let mut h = harness(app, LIGHT);
+    let body = "First line\n\nSecond line\n\nThird line\n\n| a | b |\n|---|---|\n| 1 | 2 |";
+    let page = page_of(&mut h, &s, "Widths", body);
+    let page_dir = PathBuf::from(&page);
+    notecraft_store::page::set_table_columns(&page_dir, &notecraft_model::tablecols::parse("3:110,130")).expect("widths");
+    let reopen = |h: &mut Harness<'_, NoteCraftApp>| {
+        h.state_mut().open_path(&s.md_page.to_string_lossy());
+        settle(h);
+        h.state_mut().open_path(&page);
+        settle(h);
+    };
+    let pick = |h: &mut Harness<'_, NoteCraftApp>, from: &str, to: &str| {
+        let (a, b) = (h.get_by_label(from).rect(), h.get_by_label(to).rect());
+        ask(h, "ui.press", json!({"x": a.center().x, "y": a.center().y})).expect("press");
+        settle(h);
+        ask(h, "ui.move", json!({"x": b.center().x, "y": b.center().y})).expect("drag");
+        settle(h);
+        ask(h, "ui.release", json!({"x": b.center().x, "y": b.center().y})).expect("release");
+        settle(h);
+    };
+    reopen(&mut h);
+    board.clone().set_text("Pasted").expect("clipboard");
+    pick(&mut h, "First line", "Second line");
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::V);
+    settle(&mut h);
+    let kept = notecraft_store::page::table_columns(&page_dir).expect("widths");
+    assert_eq!(kept.of(2), Some([110.0, 130.0].as_slice()), "the widths moved up with the table: {kept:?}");
+    assert_eq!(kept.of(3), None, "and nothing is kept where the table was: {kept:?}");
+
+    // Cut does the same.
+    reopen(&mut h);
+    let (a, b) = (h.get_by_label_contains("Pasted").rect(), h.get_by_label("Third line").rect());
+    ask(&mut h, "ui.press", json!({"x": a.center().x, "y": a.center().y})).expect("press");
+    settle(&mut h);
+    ask(&mut h, "ui.move", json!({"x": b.center().x, "y": b.center().y})).expect("drag");
+    settle(&mut h);
+    ask(&mut h, "ui.release", json!({"x": b.center().x, "y": b.center().y})).expect("release");
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::X);
+    settle(&mut h);
+    let kept = notecraft_store::page::table_columns(&page_dir).expect("widths");
+    assert_eq!(kept.of(1), Some([110.0, 130.0].as_slice()), "the widths moved up with the table after a cut: {kept:?}");
+}
+
+/// Issue #563: Alt+Shift+Up and Down move the paragraph with the caret one place within its box:
+/// a list item stays an item, a table's kept layout goes with the table, one Undo puts it back,
+/// and nothing moves past the top of the box.
+#[test]
+fn alt_shift_arrows_move_a_paragraph_within_its_box() {
+    let (_t, app, s) = sample_app("ui-move-paragraph");
+    let blocks = notecraft_formats::markdown::parse(notecraft_engine::sample::MD_BODY);
+    let table = blocks.iter().position(|b| matches!(b, notecraft_formats::Block::Table { .. })).expect("a table");
+    let widths = notecraft_model::tablecols::parse(&format!("{table}:110,130,150"));
+    notecraft_store::page::set_table_columns(&s.md_page, &widths).expect("table widths");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let original = h.state().body().unwrap_or_default().to_string();
+
+    // The second item of the checklist goes above the first.
+    let item = blocks
+        .iter()
+        .position(|b| {
+            matches!(b, notecraft_formats::Block::Item { .. })
+                && notecraft_formats::render::blocks_to_text(std::slice::from_ref(b)).contains("Add sections")
+        })
+        .expect("the item");
+    ask(&mut h, "ui.caret", json!({"block": item})).expect("caret");
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::ArrowUp);
+    settle(&mut h);
+    let body = h.state().body().unwrap_or_default().to_string();
+    assert!(body.contains("- [x] Add sections and pages\n- [x] Create a notebook"), "the item moved up, still an item:\n{body}");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+    assert_eq!(h.state().body().unwrap_or_default(), original, "one Undo puts it back");
+
+    // The paragraph under the title cannot go above it: the title's heading is not a block to pass.
+    ask(&mut h, "ui.caret", json!({"block": 1})).expect("caret");
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::ArrowUp);
+    settle(&mut h);
+    assert_eq!(h.state().body().unwrap_or_default(), original, "nothing moved");
+    assert!(h.state().status().contains("top"), "and the status says why: {}", h.state().status());
+
+    // The block before the table goes below it; the table's widths stay with the table.
+    ask(&mut h, "ui.caret", json!({"block": table - 1})).expect("caret");
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    settle(&mut h);
+    let kept = notecraft_store::page::table_columns(&s.md_page).expect("widths");
+    assert_eq!(kept.of(table - 1), Some([110.0, 130.0, 150.0].as_slice()), "the widths went with the table: {kept:?}");
+    assert_eq!(kept.of(table), None);
+}
+
+/// Clicks the lowest control named `label`: a menu's row, below the ribbon's button of that name.
+fn click_lowest(h: &mut Harness<'_, NoteCraftApp>, label: &str) {
+    let at = h.get_all_by_label(label).map(|n| n.rect()).max_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("a control of that name");
+    h.get_all_by_label(label).find(|n| n.rect() == at).expect("it").click();
+    settle(h);
+}
+
+/// Opens the menu of the topmost row named `title`.
+fn row_menu_of(h: &mut Harness<'_, NoteCraftApp>, title: &str) {
+    let at = h.get_all_by_label(title).map(|n| n.rect()).min_by(|a, b| a.min.y.total_cmp(&b.min.y)).expect("a row of that name");
+    h.get_all_by_label(title).find(|n| n.rect() == at).expect("row").click_secondary();
+    settle(h);
+}
+
+/// Issue #532: a page row's Copy and Cut hold the page, and Paste on another page puts it just
+/// after that page, or on a section last in it. A copy brings its subpages, files and ink and
+/// sits beside the original under a name of its own; a cut page stays where it is until pasted.
+#[test]
+fn page_rows_cut_copy_and_paste_pages() {
+    let (_t, app, s) = sample_app("ui-page-clipboard");
+    // Ink and a file of the deep page's own, to see that they come with the copy.
+    std::fs::write(s.deep_page.join("ink.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>").expect("ink");
+    std::fs::create_dir_all(s.deep_page.join("assets")).expect("assets");
+    std::fs::write(s.deep_page.join("assets").join("note.txt"), "kept").expect("a file");
+    let mut h = harness(app, LIGHT);
+    h.state_mut().open_path(&s.html_page.to_string_lossy());
+    settle(&mut h);
+    let ideas = s.md_page.parent().expect("Ideas").to_path_buf();
+    let pages_in = |dir: &std::path::Path| -> Vec<PathBuf> {
+        let mut v: Vec<(u32, PathBuf)> = notecraft_store::tree::child_dirs(dir)
+            .into_iter()
+            .filter_map(|d| notecraft_store::tree::read_node(&d).filter(|n| n.kind == notecraft_model::NodeKind::Page).map(|n| (n.order, d)))
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, d)| d).collect()
+    };
+
+    // Copy Deep page, paste it on Format ideas: it goes just after that page, with all it holds.
+    row_menu_of(&mut h, "Deep page");
+    click_lowest(&mut h, "Copy");
+    settle(&mut h);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    row_menu_of(&mut h, "Format ideas");
+    h.get_by_label("Paste page").click();
+    settle(&mut h);
+    let listed = pages_in(&ideas);
+    assert_eq!(listed.len(), 2, "Ideas has the copy: {listed:?}");
+    assert!(same_dir(&listed[0], &s.md_page), "after Format ideas");
+    let copy = &listed[1];
+    assert_eq!(notecraft_store::tree::read_node(copy).map(|n| n.title).as_deref(), Some("Deep page"));
+    assert!(copy.join("ink.svg").is_file() && copy.join("assets").join("note.txt").is_file(), "with its ink and files");
+    assert!(!pages_in(copy).is_empty(), "and its subpages");
+    assert!(s.deep_page.is_dir(), "the original stays");
+    // Pasted again, beside the first copy, under a folder name of its own.
+    row_menu_of(&mut h, "Format ideas");
+    h.get_by_label("Paste page").click();
+    settle(&mut h);
+    let listed = pages_in(&ideas);
+    assert_eq!(listed.len(), 3, "a second copy: {listed:?}");
+    assert_ne!(listed[1], listed[2]);
+
+    // Cut Format ideas: it stays until pasted, then moves last into Projects.
+    row_menu_of(&mut h, "Format ideas");
+    click_lowest(&mut h, "Cut");
+    settle(&mut h);
+    assert!(s.md_page.is_dir(), "a cut page stays where it is until it is pasted");
+    if let Some(expand) = h.query_by_label("Expand Work") {
+        expand.click();
+        settle(&mut h);
+    }
+    row_menu_of(&mut h, "Projects");
+    h.get_by_label("Paste page").click();
+    settle(&mut h);
+    let projects = s.html_page.parent().expect("Projects");
+    let moved = pages_in(projects);
+    assert!(
+        moved.last().and_then(|p| notecraft_store::tree::read_node(p)).is_some_and(|n| n.title == "Format ideas"),
+        "moved last into Projects: {moved:?}"
+    );
+    assert!(!s.md_page.exists(), "and gone from Ideas");
 }
