@@ -1365,6 +1365,37 @@ pub fn is_title_echo(blocks: &[Block], i: usize, title: &str) -> bool {
 /// It is drawn as a stamp, quiet and grey, the way OneNote draws the date under a page
 /// title, rather than as an ordinary paragraph. It is still a paragraph in the file, so
 /// anything can read it; this only says which one it is.
+/// Where the page's stamp, the date and time below its title, was drawn: its block and its
+/// rectangle, with the pass it was drawn in, so the page's menu can offer to change it when it
+/// is opened over it (issue #541).
+fn stamp_place_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("page-stamp-place", ctx.viewport_id()))
+}
+
+/// Notes where the block just drawn is, when it is the page's stamp and reads as a date and time
+/// the dialog can show: a first line such as "Thursday, planning notes" is not offered (it
+/// would be taken off the page, read as neither).
+fn note_stamp(ui: &mut Ui, blocks: &[Block], i: usize, top: f32) {
+    let readable = || match blocks.get(i) {
+        Some(Block::Paragraph(spans, _)) => notecraft_model::time::parse_stamp(&spans.iter().map(|s| s.text.as_str()).collect::<String>()).is_some(),
+        _ => false,
+    };
+    if is_page_stamp(blocks, i) && readable() {
+        let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().min.y.max(top + 1.0));
+        let pass = ui.ctx().cumulative_pass_nr();
+        let id = stamp_place_id(ui.ctx());
+        ui.data_mut(|d| d.insert_temp(id, (i, rect, pass)));
+    }
+}
+
+/// The page's stamp block and where it was drawn, if it was drawn this pass or the one before.
+pub fn stamp_place(ctx: &egui::Context) -> Option<(usize, egui::Rect)> {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data(|d| d.get_temp::<(usize, egui::Rect, u64)>(stamp_place_id(ctx)))
+        .filter(|(_, _, drawn)| pass.saturating_sub(*drawn) <= 1)
+        .map(|(i, rect, _)| (i, rect))
+}
+
 pub fn is_page_stamp(blocks: &[Block], i: usize) -> bool {
     // The first block of a page, or the second when the page opens with its own heading.
     let after_heading = i == 1 && matches!(blocks.first(), Some(Block::Heading { level: 1, .. }));
@@ -1376,7 +1407,8 @@ pub fn is_page_stamp(blocks: &[Block], i: usize) -> bool {
     match blocks.get(i) {
         Some(Block::Paragraph(spans, _)) => {
             let words: String = spans.iter().map(|s| s.text.as_str()).collect();
-            notecraft_model::time::is_long_date(&words)
+            // With its time left off, or its date, it is still the stamp (issue #541).
+            notecraft_model::time::is_long_date(&words) || notecraft_model::time::parse_stamp(&words).is_some()
         }
         _ => false,
     }
@@ -2262,6 +2294,11 @@ pub fn autolink_typed(caret: &mut Caret, block: &Block) -> bool {
     let Some((start, end, markup)) = autolink_typed_address(&caret.text, at) else {
         return false;
     };
+    // An address already inside a link keeps that link's target: nothing is written over it.
+    let inside_link = caret.inline.as_ref().is_some_and(|inline| (start..end).any(|i| inline_edit::link_span(inline.spans(), i).is_some()));
+    if inside_link {
+        return false;
+    }
     caret.replace_range(block, (start, end), &markup);
     caret.selection = (at, at);
     caret.place = Some(at);
@@ -2776,6 +2813,7 @@ pub fn show_blocks(
                         }
                     }
                 }
+                note_stamp(ui, blocks, i, top);
                 frame_block(ui, top, outlined, t, zoom);
                 paragraph_header_below(ui, page_dir, blocks, i, &mut changed, zoom);
                 if let Some(a) = action.take() {
@@ -2922,6 +2960,12 @@ pub fn show_blocks(
                     remember_caret_anchor(ui, &out, c);
                     let mut cursor_range = out.cursor_range;
                     // Issue #540: a web address that a space has just followed becomes a link.
+                    // The caret is where the text box has it now, not where it was before the key.
+                    if out.response.changed()
+                        && let Some(r) = cursor_range
+                    {
+                        c.selection = (r.primary.index.0, r.secondary.index.0);
+                    }
                     if out.response.changed() && autolink_typed(c, &block) {
                         ui.ctx().request_repaint();
                     }
@@ -3112,6 +3156,7 @@ pub fn show_blocks(
                     }
                 }
             }
+            note_stamp(ui, blocks, i, top);
             frame_block(ui, top, outlined, t, zoom);
             paragraph_header_below(ui, page_dir, blocks, i, &mut changed, zoom);
         } else {
@@ -3247,6 +3292,7 @@ pub fn show_blocks(
                 let over_link = resp.hover_pos().and_then(|p| link_under(ui, &block, &resp, p, t, page, zoom)).is_some();
                 ui.ctx().set_cursor_icon(if over_link { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Text });
             }
+            note_stamp(ui, blocks, i, top);
             frame_block(ui, top, false, t, zoom);
             paragraph_header_below(ui, page_dir, blocks, i, &mut changed, zoom);
         }
@@ -4660,6 +4706,17 @@ mod tests {
 
         let mut plain = Caret { text: "no space yet https://example.test".into(), selection: (33, 33), ..caret.clone() };
         assert!(!autolink_typed(&mut plain, &block), "nothing happens until a space is typed");
+    }
+
+    /// Issue #540 review: an address already inside a link is left alone, so its target is kept.
+    #[test]
+    fn an_address_inside_a_link_is_not_linked_again() {
+        let block = blocks("[https://example.test/x](https://example.test/x)").remove(0);
+        let typed = "https://example.test/x ";
+        let end = typed.chars().count();
+        let mut caret =
+            Caret { block: 0, text: typed.to_string(), focus: true, selection: (end, end), place: None, cell: None, span: None, inline: None };
+        assert!(!autolink_typed(&mut caret, &block), "the link keeps its own target");
     }
 
     /// Issue #165: the Format Painter picks up the formatting at the caret and puts exactly that
