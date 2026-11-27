@@ -10,7 +10,7 @@ use notecraft_store::recycle::Recycled;
 use notecraft_store::tags::Tagged;
 use notecraft_store::{StoreError, assets, check, ops, page, page_templates, recycle, search, tags, tree};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub type Params = BTreeMap<String, String>;
 
@@ -76,12 +76,54 @@ fn node_create(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
     let title = p.get("title").map(|t| t.trim()).filter(|t| !t.is_empty());
     // A section group or section always needs a real title. A page does not: leaving
     // `title` out (or blank) creates it untitled, the "Add Page" case.
+    // A new page in a section that has a template for its new pages starts from it (issue
+    // #519), in the place asked for. A template no longer there gives a blank page as before.
+    // A subpage, made under a page, starts from the template of the section it is in.
+    let section = parent.ancestors().find(|a| tree::read_node(a).is_some_and(|n| n.kind != NodeKind::Page)).map(Path::to_path_buf);
+    let template = (kind == NodeKind::Page && title.is_none() && p.get("format").is_none_or(|f| f.trim().is_empty()))
+        .then(|| section.filter(|d| tree::read_node(d).is_some_and(|n| n.kind == NodeKind::Section)).and_then(|d| ops::default_template(&d)))
+        .flatten()
+        .and_then(|id| page_templates::find(s.root(), &id));
+    if let Some(template) = template {
+        let page = page_templates::new_page(&template, &parent, &s.settings)?;
+        if let Some(order) = order {
+            let before = tree::child_dirs(&parent)
+                .into_iter()
+                .find(|d| *d != page && tree::read_node(d).is_some_and(|n| n.kind == NodeKind::Page && n.order >= order));
+            return Ok(Output::Path(ops::place_node(&page, &parent, before.as_deref())?));
+        }
+        return Ok(Output::Path(page));
+    }
     let dir = match title {
         Some(title) => ops::create_node_at(&parent, title, kind, opt_format(p)?, &s.settings, order)?,
         None if kind == NodeKind::Page => ops::create_untitled_page(&parent, opt_format(p)?, order, &s.settings)?,
         None => return Err(EngineError::MissingParam("title")),
     };
     Ok(Output::Path(dir))
+}
+
+/// The template a section's new pages start from (issue #519): `template` is one
+/// `page.templates` lists, or left out to clear it.
+fn section_merge(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let into = s.resolve(req(p, "into")?)?;
+    let merged = ops::merge_section(&s.resolve(req(p, "path")?)?, &into)?;
+    // Where each page went, by its folder's name in the section it left and the one it went to,
+    // so a caller holding its own spelling of the two sections can follow them.
+    let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let moved: Vec<[String; 2]> = merged.moved.iter().map(|(from, to)| [name(from), name(to)]).collect();
+    Ok(Output::Text(serde_json::json!({ "into": into, "moved": moved }).to_string()))
+}
+
+fn section_set_template(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
+    let section = s.resolve(req(p, "path")?)?;
+    let template = p.get("template").map(|t| t.trim()).filter(|t| !t.is_empty());
+    if let Some(id) = template
+        && page_templates::find(s.root(), id).is_none()
+    {
+        return Err(EngineError::BadParam(format!("there is no template {id}; page.templates lists them")));
+    }
+    ops::set_default_template(&section, template)?;
+    Ok(Output::Text(template.map_or_else(|| "no template for new pages".to_string(), |t| format!("new pages start from {t}"))))
 }
 
 fn node_demote(s: &mut Session, p: &Params) -> Result<Output, EngineError> {
@@ -779,6 +821,23 @@ to (required): where the copy goes; it is put last there, and every node in it g
         params: "",
         changes_tree: false,
         run: page_templates_list,
+    },
+    CommandSpec {
+        id: "section.set_template",
+        label: "Set the template new pages in a section start from",
+        params: "path (required): the section
+template: the template's id, as page.templates lists it; left out, new pages start blank",
+        changes_tree: false,
+        run: section_set_template,
+    },
+    CommandSpec {
+        id: "section.merge",
+        label: "Merge a section into another: its pages go after the other's, and the emptied section goes, a copy of it in the recycle bin",
+        params: "path (required): the section whose pages move
+into (required): the section they go into
+Returns JSON: `into`, and `moved`, each page as [its folder name before, its folder name now]",
+        changes_tree: true,
+        run: section_merge,
     },
     CommandSpec {
         id: "page.from_template",

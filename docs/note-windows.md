@@ -5,16 +5,24 @@ Navigation, page zoom, selection and the page history belong to each window.
 Closing one note window leaves the others open. If the original window closes first,
 the application keeps a hidden event-loop window until the final note window closes.
 
+View > New docked window does the same and docks the new window to the side of the screen, as
+Dock to Desktop does, once the new window knows which screen it is on; the window it was opened
+from stays as it is (issue #554). Undocking the new window is View > Dock to desktop in it.
+
 View > New quick note (Ctrl+Shift+M) creates an ordinary untitled page and opens a compact
 editor. Notes autosave to the Quick Notes section in the Quick Notes notebook under the
-configured notebooks folder. They remain after closing the window. Open that section in
-the normal notebook tree to reopen or move a note. Exit Full Page View to show navigation
+configured notebooks folder. They remain after closing the window. Quick Notes, under the
+notebooks in the navigator, opens the section they are kept in with its notes listed; before
+the first Quick Note it says there are none yet and offers to make one (issue #566). The
+notes can also be reopened or moved from the normal notebook tree. Exit Full Page View to show navigation
 in the compact window. The regular formatting, attachments and Always on Top controls
 remain available.
 
 The default destination is `<notebooks>/quick-notes/quick-notes`. It never uses the bundled
-Welcome notebook. An optional `quick_notes_section` setting selects an existing section,
-as a path relative to the notebooks folder or an absolute path in an open notebook.
+Welcome notebook. File > Options > Quick Notes section chooses another section from the
+sections there are, says where new Quick Notes go, and goes back to the default; notes already
+made stay where they were saved (issue #567). The choice is the `quick_notes_section` setting:
+a path relative to the notebooks folder or an absolute path in an open notebook.
 A missing, invalid or unwritable destination reports an error. It does not silently switch
 sections or remove existing notes. The new page follows the destination's format cascade.
 

@@ -150,7 +150,10 @@ narrower than 600 points, on Android, a narrow desktop window or the browser bui
   names, a file in the program the system has for it, or a web address in the browser; the
   target is a path as written, so a renamed page breaks the links to it. Links by id are not
   defined (`folder-format.md` section 10). Not clickable yet: a link inside a table cell, and
-  one in a line that mixes left-to-right and right-to-left text.
+  one in a line that mixes left-to-right and right-to-left text. Insert > Link (Ctrl+K) can also find a
+  notebook, section or page by name and link to it (issue #539). A web address typed in the
+  words of a paragraph, heading, list item or quote becomes a link when a space or a new line
+  ends it (issue #540); not yet in a table cell, nor when pasted.
 - **One weight per bundled script.** Arabic, Hebrew, Devanagari, Chinese, Japanese and
   Korean draw from bundled Noto faces (the CJK one is 16 MB, most of the app's size), but in
   one weight each and with Simplified Chinese forms for characters the CJK scripts share; a
@@ -467,6 +470,17 @@ narrower than 600 points, on Android, a narrow desktop window or the browser bui
   keeps them and another page is not touched. The window's own rule-lines setting stays as
   what a page with none of its own is drawn on. **Not built:** a rule line colour, and
   "always create pages with rule lines".
+- **Merge into Another Section** is on a section's menu, in the tree and on its tab, as in OneNote
+  (issue #517). Its pages, with their subpages, files and ink, go into the section picked, after
+  the pages there and in their order; the emptied section goes. The pages keep their ids, so a
+  link to one still finds it, and a page whose folder name is taken there gets the next free
+  name, its title as it was. Before anything moves, a copy of the section as it was goes to the
+  notebook's recycle bin, which is how the merge is undone. Each page's move is noted as it is
+  made, so if any step fails the pages moved go back to their places, across drives too, and the
+  section is left as it was. A page that is a link to a folder elsewhere is not moved: the merge
+  is refused. Pages a sync tool brings in while it runs are moved as well, and the section is
+  only taken away once no page is left in it. The engine command is `section.merge`, which
+  reports where each page went.
 - **Copy link to page**, **to section** and **to notebook** are on the tree's menus, as in OneNote
   (a section's tab in the Tabs layout has its section's menu too). A section's or notebook's link
   opens it at the page last open there, else its first page. The link
@@ -504,8 +518,11 @@ narrower than 600 points, on Android, a narrow desktop window or the browser bui
   Built: the Draw tab; five nibs (pen, pencil, fountain pen, brush pen, highlighter); a
   rack the owner arranges, with Add, a right-click menu, a Modify Tool editor for colour
   and thickness, and the whole rack remembered between runs; a pressure sensitivity wedge;
-  an eraser; undo; Save picture; picking ink up with Select or a lasso to move, stretch
-  or delete it; and ten regular shapes - line, arrow, rectangle, rounded rectangle, square,
+  an eraser that takes away the whole stroke, and Small, Medium and Large erasers that rub
+  out only the ink under them, chosen from the eraser's menu and shown as a circle on the
+  page (issue #545); undo; Save picture; picking ink up with Select or a lasso to move,
+  stretch, delete, turn a quarter either way or mirror it (Draw > Rotate, offered while ink is
+  picked up, issue #544); and ten regular shapes - line, arrow, rectangle, rounded rectangle, square,
   ellipse, circle, diamond, triangle and star - drawn by dragging out the two corners they
   sit between. A drawn shape is ink like any other stroke, so the eraser, Select and Undo
   Stroke all work on it; it is not kept as a shape that can be turned back into a perfect
@@ -624,8 +641,9 @@ narrower than 600 points, on Android, a narrow desktop window or the browser bui
   rather than under the line. Page Templates opens a pane
   of templates by category (Academic, Blank, Business, Planners and the user's own); a click
   adds a page to the open section from one, and the open page can be saved as a template.
-  **Not built:** previews of the templates, a default template for new pages, and removing a
-  saved template from the pane (`page.remove_template` does it). Spreadsheet is
+  A section can keep a template its new pages start from, chosen at the foot of the pane
+  (issue #519). **Not built:** previews of the templates, and removing a saved template from
+  the pane (`page.remove_template` does it). Spreadsheet is
   available through the existing GridCraft integration when installed.
   Insert Space is
   OneNote's tool: with it in hand, a drag down the page moves every box and every stroke of

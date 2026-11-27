@@ -22,7 +22,8 @@ Page order is preserved when either action changes the hierarchy.
 ## Notebooks, sections and pages
 
 These work from the page's words and title, and from the notebooks; another text box with the
-keyboard (the search box, a rename) and an open dialog keep the keys.
+keyboard (the search box, a rename) and an open dialog keep the keys. Pages picked together are
+moved or copied together by Move or Copy, in their order; a plain click puts them down.
 
 | Action | Windows and Linux | macOS |
 |---|---|---|
@@ -34,6 +35,8 @@ keyboard (the search box, a rename) and an open dialog keep the keys.
 | Switch notebook (a list; Up, Down, Enter; Escape stays) | `Ctrl+G` | `Cmd+G` |
 | Keyboard to the open section's row | `Ctrl+Shift+G` | `Cmd+Shift+G` |
 | Keyboard to the open page's row | `Ctrl+Alt+G` | `Option+Cmd+G` |
+| On a page row: pick it with others, or put it down | `Ctrl+Space` or `Ctrl`+click | `Cmd+Space` or `Cmd`+click |
+| On a page row: pick every page from the last picked to it | `Shift+Space` or `Shift`+click | `Shift+Space` or `Shift`+click |
 | Keyboard to the page's title (Escape goes back to the words) | `Ctrl+Shift+T` | `Cmd+Shift+T` |
 
 A section opens at the page last open in it, or at its first page; an empty section says so on
@@ -56,6 +59,24 @@ Each of these that changes the page is one step for Undo. On a locked page they 
 the status line says the page is locked. Alt+Down and Alt+Up go through the note containers the way
 the page reads: from the top down, with containers whose tops are within a line of each other taken
 as one row, from the left, or from the right on a right-to-left page. Paste's options on the Home tab also offer **Keep text only**.
+
+## Find on this page
+
+Search's **Find on this page**, with a result on the open page chosen, opens the find bar over
+the page (issue #526). Every place the words are is lit, the current one in a stronger colour,
+and the bar says which of how many it is.
+
+| Action | Windows and Linux | macOS |
+|---|---|---|
+| The next place found, round from the last | `F3`, or `Enter` in the bar | `F3`, or `Enter` in the bar |
+| The place found before | `Shift+F3`, or `Shift+Enter` in the bar | `Shift+F3`, or `Shift+Enter` in the bar |
+| Close the bar, the caret on the current place with its words picked | `Escape` | `Escape` |
+
+With the bar closed, `F3` opens it again with the words last looked for. The words are matched as a
+phrase, across marks such as bold and across a line break, letter case aside, in the page's words
+and in each cell of its tables. Places in table cells, in a paragraph with a picture or an
+equation in its line, and in a line that mixes the two directions of writing are found, counted
+and gone to, and Escape puts the caret there, but they are not lit.
 
 ## Page view
 

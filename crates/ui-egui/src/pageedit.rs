@@ -835,8 +835,84 @@ pub fn wrap_selection_with(text: &str, selection: (usize, usize), open: &str, cl
     (format!("{before}{open}{middle}{close}{after}"), (start, end))
 }
 
-/// Puts `insert` where the caret is, replacing whatever is selected. Returns the new text
-/// and where the caret ends up.
+/// A web address typed just before the caret, as the next space or line ends it (issue #540): the
+/// characters it covers and where it leads. Only `http://`, `https://` and `www.` addresses, in
+/// the words of a paragraph, heading, list item or quote; not in a code block, a table cell, a
+/// piece of code or words already a link. Punctuation that ends a sentence after it is not
+/// part of it, nor a closing bracket it did not open.
+pub fn url_before_caret(blocks: &[Block], caret: &Caret) -> Option<(usize, usize, String)> {
+    let block = blocks.get(caret.block)?;
+    if caret.cell.is_some() || !matches!(block, Block::Paragraph(..) | Block::Heading { .. } | Block::Item { .. } | Block::Quote(..)) {
+        return None;
+    }
+    if caret.selection.0 != caret.selection.1 {
+        return None;
+    }
+    let chars: Vec<char> = caret.text.chars().collect();
+    let at = caret.selection.0.min(chars.len());
+    let mut start = chars[..at].iter().rposition(|c| c.is_whitespace()).map_or(0, |i| i + 1);
+    // An address in brackets or quotes: what opens round it stays outside the link.
+    while start < at && matches!(chars[start], '(' | '"' | '\'' | '[' | '<' | '{' | '\u{201c}' | '\u{2018}') {
+        start += 1;
+    }
+    let mut end = at;
+    loop {
+        let &last = chars[start..end].last()?;
+        let opened = chars[start..end].iter().filter(|c| **c == '(').count();
+        let closed = chars[start..end].iter().filter(|c| **c == ')').count();
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '\u{201d}' | '\u{2019}' | ']' | '>' | '}')
+            || (last == ')' && closed > opened)
+        {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    let token: String = chars[start..end].iter().collect();
+    let lower = token.to_ascii_lowercase();
+    let rest = ["https://", "http://", "www."].iter().find_map(|p| lower.strip_prefix(p))?;
+    // Something after the scheme, with a dot in a www. address, and nothing that is markup.
+    if rest.is_empty()
+        || (lower.starts_with("www.") && !rest.contains('.'))
+        || token.chars().any(|c| matches!(c, '[' | ']' | '<' | '>' | '`') || c.is_control())
+    {
+        return None;
+    }
+    let href = if lower.starts_with("www.") { format!("https://{token}") } else { token.clone() };
+    if !linkable_address(&href) {
+        return None;
+    }
+    // Not words that are already a link, or code.
+    let inline = caret.inline.clone().unwrap_or_else(|| InlineEdit::new(block, true));
+    let mut from = 0;
+    for span in inline.spans() {
+        // A picture is one character of the line, whatever its words for a screen reader.
+        let to = from + if span.image.is_some() { 1 } else { span.text.chars().count() };
+        if to > start && from < end && (span.link.is_some() || span.code) {
+            return None;
+        }
+        from = to;
+    }
+    Some((start, end, href))
+}
+
+/// Makes the characters `start..end` of the caret's line a link to `href`, the words as they
+/// are (issue #540). The caret stays where it was.
+pub fn link_caret_range(blocks: &mut [Block], caret: &mut Caret, (start, end, href): (usize, usize, String)) {
+    let Some(block) = blocks.get_mut(caret.block) else { return };
+    let source = caret.ensure_inline(block).clone();
+    let len = source.text().chars().count();
+    let (start, end) = (start.min(len), end.min(len));
+    let mut head = source.slice(0..start);
+    let middle: Vec<Span> = source.slice(start..end).spans().iter().cloned().map(|s| Span { link: Some(href.clone()), ..s }).collect();
+    head.join(InlineEdit::from_spans(&middle));
+    head.join(source.slice(end..len));
+    let text = head.text().to_owned();
+    head.write(block, &text);
+    caret.text = head.text().to_owned();
+    caret.inline = Some(head);
+}
+
 /// Puts plain text in at the caret exactly as written: no Markdown is read in it, so stars,
 /// brackets and backticks stay words (Ctrl+Shift+V, issue #535). The words on both sides of
 /// the caret keep their own formatting. The first line replaces the selection; with more than
@@ -906,6 +982,8 @@ pub fn insert_plain_lines(blocks: &mut Vec<Block>, caret: &mut Caret, lines: &[&
     count
 }
 
+/// Puts `insert` where the caret is, replacing whatever is selected. Returns the new text
+/// and where the caret ends up.
 pub fn insert_at_caret(text: &str, selection: (usize, usize), insert: &str) -> (String, usize) {
     let chars: Vec<char> = text.chars().collect();
     let (a, b) = (selection.0.min(selection.1).min(chars.len()), selection.0.max(selection.1).min(chars.len()));
@@ -1682,6 +1760,19 @@ fn table(
         (Some(x0), Some(x1), Some(y0), Some(y1)) => Some(egui::Rect::from_min_max(egui::pos2(*x0, *y0), egui::pos2(*x1, *y1))),
         _ => None,
     };
+    // A place found by Find on this page in one of the cells is brought into view: that cell,
+    // not the whole table, which may be taller than the window (issue #526).
+    let marks_id = find_marks_id(ui.ctx());
+    if let Some(cell) = ui.data(|d| d.get_temp::<FindMarks>(marks_id)).filter(|m| m.reveal == Some(i)).and_then(|m| m.reveal_cell)
+        && let Some(rect) = cell_rect(cell.0, cell.1)
+    {
+        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+        ui.data_mut(|d| {
+            let marks = d.get_temp_mut_or_default::<FindMarks>(marks_id);
+            marks.reveal = None;
+            marks.reveal_cell = None;
+        });
+    }
     // Every cell, as a rectangle that touches its neighbours: a pointer anywhere in the
     // table is in exactly one cell, borders and gaps included.
     // A cell under a merged cell answers as the merged cell, whose words are in its first cell,
@@ -2132,6 +2223,51 @@ pub fn linkable_address(address: &str) -> bool {
     !matches!(scheme.as_deref(), Some("javascript" | "vbscript" | "data"))
 }
 
+/// Issue #540: the web address that ends just before a space typed at `at` (in characters), as
+/// `(start, end, markup)`: where the address starts and ends (trailing punctuation left out) and
+/// `[address](address)` to write in its place. `None` when no safe address is there.
+pub fn autolink_typed_address(text: &str, at: usize) -> Option<(usize, usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let at = at.min(chars.len());
+    if at == 0 || chars[at - 1] != ' ' {
+        return None;
+    }
+    let space = at - 1;
+    let start = chars[..space].iter().rposition(|c| c.is_whitespace()).map_or(0, |p| p + 1);
+    let mut end = space;
+    while end > start && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | ')') {
+        end -= 1;
+    }
+    let word: String = chars[start..end].iter().collect();
+    let web = word.starts_with("https://") || word.starts_with("http://");
+    let plain = !word.contains(['[', ']', '(', ')', '<', '>', '*', '_', '`', '\\']);
+    if !web || word.chars().count() <= "https://".len() || !plain || !linkable_address(&word) {
+        return None;
+    }
+    Some((start, end, format!("[{word}]({word})")))
+}
+
+/// Issue #540: when a space is typed after a web address, the address becomes a link. The
+/// caret's text takes the link markup, which the next write turns into a real link. `true`
+/// when the text changed.
+pub fn autolink_typed(caret: &mut Caret, block: &Block) -> bool {
+    if caret.selection.0 != caret.selection.1 {
+        return false;
+    }
+    // Bring the spans up to what was typed, on a copy, so the link is made on the spans (as
+    // the Link dialog makes it) and not by writing markup into the text.
+    let mut scratch = block.clone();
+    caret.write(&mut scratch);
+    let at = caret.selection.0;
+    let Some((start, end, markup)) = autolink_typed_address(&caret.text, at) else {
+        return false;
+    };
+    caret.replace_range(block, (start, end), &markup);
+    caret.selection = (at, at);
+    caret.place = Some(at);
+    true
+}
+
 /// Sorts a table's rows by one column, as OneNote's Table > Sort does (issue #171). Whole rows
 /// move, so every cell stays with its row and keeps its formatting. The heading row is never
 /// sorted: it stays on top. `rows` limits the sort to the body rows from one table row to
@@ -2474,6 +2610,8 @@ pub fn show_blocks(
         return changed;
     }
 
+    // Find on this page (issue #526): every place the words are, lit, the current one more so.
+    let found = ui.data(|d| d.get_temp::<FindMarks>(find_marks_id(ui.ctx())));
     for i in range.start..range.end.min(count) {
         let Some(block) = blocks.get(i).cloned() else { continue };
         // The title area above the page is already showing this; see `is_title_echo`.
@@ -2509,6 +2647,14 @@ pub fn show_blocks(
             if let Some(what) = table(ui, &block, i, caret, t, page, cols, &mut changed, zoom, true) {
                 action = Some(what);
             }
+            // A place found in one of its cells is brought into view (issue #526): the table
+            // shows the cell itself; this is for one whose cell it could not place.
+            let id = find_marks_id(ui.ctx());
+            if ui.data(|d| d.get_temp::<FindMarks>(id)).is_some_and(|f| f.reveal == Some(i)) {
+                let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().min.y.max(top + 1.0));
+                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                ui.data_mut(|d| d.get_temp_mut_or_default::<FindMarks>(id).reveal = None);
+            }
             frame_block(ui, top, editing, t, zoom);
             continue;
         }
@@ -2542,6 +2688,9 @@ pub fn show_blocks(
             let mut selection = None;
             let mut ticked = None;
             let mut input_caret = None;
+            // The laid-out words and where they were drawn, to find the caret's line again once
+            // its place is settled for this frame.
+            let mut drawn_words: Option<(std::sync::Arc<egui::Galley>, egui::Pos2)> = None;
             let id = ui.make_persistent_id(("page-block", i));
             changed.mark = formatting_key(ui, id);
             // A line that reads right to left is written from the right: its bullet, box or
@@ -2745,6 +2894,16 @@ pub fn show_blocks(
                                 });
                             }
                         }
+                        // A right click inside the words of a selection: the text box is about to
+                        // collapse it, so ask for it back for this frame. The page's menu then acts
+                        // on the words (Cut, Copy, Link) where they were.
+                        let right_here = ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary))
+                            && ui.input(|input| input.pointer.hover_pos()).is_some_and(|p| ui.max_rect().contains(p));
+                        if right_here && c.selection.0 != c.selection.1 {
+                            log::debug!("right click kept the selection: block={i} selection={:?}", c.selection);
+                            let restore = restore_selection_id(ui.ctx());
+                            ui.data_mut(|d| d.insert_temp(restore, (i, c.selection.0, c.selection.1)));
+                        }
                         let at = (i, c.text.clone(), c.selection);
                         steady_blink(ui, (at.0, &at.1, at.2), |ui| {
                             egui::TextEdit::singleline(&mut GraphemeBuffer(&mut c.text))
@@ -2762,6 +2921,10 @@ pub fn show_blocks(
                     #[cfg(feature = "voice")]
                     remember_caret_anchor(ui, &out, c);
                     let mut cursor_range = out.cursor_range;
+                    // Issue #540: a web address that a space has just followed becomes a link.
+                    if out.response.changed() && autolink_typed(c, &block) {
+                        ui.ctx().request_repaint();
+                    }
                     let (left, right, shift) = ui.input(|input| {
                         let mut left = false;
                         let mut right = false;
@@ -2808,6 +2971,7 @@ pub fn show_blocks(
                     if let Some(range) = cursor_range {
                         input_caret = Some(out.galley.pos_from_cursor(range.primary).translate(out.galley_pos.to_vec2()));
                     }
+                    drawn_words = Some((out.galley.clone(), out.galley_pos));
                     if let Some(r) = cursor_range {
                         selection = Some((r.primary.index.0, r.secondary.index.0));
                     }
@@ -2864,10 +3028,15 @@ pub fn show_blocks(
             }
             // Brought into view when the keyboard has just sent the caret here from afar: the
             // caret's own line, which in a long block is not the block's middle.
+            // Measured from where the caret is now, after the arrival and any selection put back
+            // above have moved it.
             let reveal = reveal_caret_id(ui.ctx());
             if ui.data_mut(|d| d.remove_temp::<bool>(reveal)).unwrap_or(false) {
-                match input_caret {
-                    Some(line) => ui.scroll_to_rect(line.expand2(vec2(0.0, 24.0)), Some(egui::Align::Center)),
+                match &drawn_words {
+                    Some((galley, at)) => {
+                        let line = galley.pos_from_cursor(egui::text::CCursor::new(c.selection.0)).translate(at.to_vec2());
+                        ui.scroll_to_rect(line.expand2(vec2(0.0, 24.0)), Some(egui::Align::Center));
+                    }
                     None => resp.scroll_to_me(Some(egui::Align::Center)),
                 }
             }
@@ -2951,6 +3120,20 @@ pub fn show_blocks(
             // The date under the title is drawn as a stamp: grey and quiet, the way
             // OneNote shows it, rather than as another paragraph of the page.
             let stamp = is_page_stamp(blocks, i);
+            let lit: Vec<(usize, usize, bool)> = found
+                .as_ref()
+                .map(|f| {
+                    f.found
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (b, _, _))| *b == i)
+                        .filter_map(|(k, &(_, a, b))| {
+                            drawn_covering(&block, byte_of_caret(&block, a), byte_of_caret(&block, b)).map(|(x, y)| (x, y, f.current == Some(k)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let _lit = preview::light_found(lit);
             let out = ui
                 .scope(|ui| {
                     if stamp {
@@ -2975,6 +3158,12 @@ pub fn show_blocks(
                 })
                 .inner;
             let resp = out.response;
+            // The current place found is brought into view once, when it becomes current.
+            if found.as_ref().is_some_and(|f| f.reveal == Some(i)) {
+                ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
+                let id = find_marks_id(ui.ctx());
+                ui.data_mut(|d| d.get_temp_mut_or_default::<FindMarks>(id).reveal = None);
+            }
             log::trace!(
                 "page block rendered: block={} stamp={} kind={} rect=({:.1},{:.1})-({:.1},{:.1}) size=({:.1}x{:.1})",
                 i,
@@ -3030,6 +3219,15 @@ pub fn show_blocks(
                     }
                 }
             }
+            // Over a link the pointer is a hand, as in a browser: a click follows the link.
+            if resp.hovered()
+                && is_writable(&block)
+                && !contains_inline_image(&block)
+                && let Some(p) = resp.hover_pos()
+                && link_under(ui, &block, &resp, p, t, page, zoom).is_some()
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
             if let Some(done) = out.task_set {
                 action = Some(Action::SetTask(i, done));
             } else if (resp.clicked() || resp.double_clicked()) && is_writable(&block) {
@@ -3060,6 +3258,24 @@ pub fn show_blocks(
         apply_keeping_widths(a, blocks, caret, &mut changed, cols);
     }
     changed
+}
+
+/// Find on this page (issue #526): every place on the page the words are, as (block, start,
+/// end) in the characters the caret counts, which of them is the current one, and the block
+/// to bring into view once. The window sets it while the find bar is open.
+#[derive(Clone, Debug, Default)]
+pub struct FindMarks {
+    pub found: Vec<(usize, usize, usize)>,
+    pub current: Option<usize>,
+    pub reveal: Option<usize>,
+    /// The table cell to bring into view, when the place to reveal is in one.
+    pub reveal_cell: Option<(usize, usize)>,
+}
+
+/// Where a window keeps [`FindMarks`] for its page to draw: one place per window, so a find in
+/// one note window lights nothing in another.
+pub fn find_marks_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("page-find-marks", ctx.viewport_id()))
 }
 
 /// A selection that runs across more than one block: where the drag began and where it has
@@ -4361,6 +4577,41 @@ mod tests {
         notecraft_formats::markdown::parse(md)
     }
 
+    /// Issue #540: an address typed in brackets or quotes is linked without them, and a picture
+    /// earlier in the line counts as one character when looking for links and code.
+    #[test]
+    fn a_typed_address_leaves_its_brackets_and_counts_a_picture_once() {
+        let at = |md: &str, text: &str| {
+            let blocks = blocks(md);
+            let n = text.chars().count();
+            let caret =
+                Caret { block: 0, text: text.to_string(), focus: true, selection: (n, n), place: Some(n), cell: None, span: None, inline: None };
+            url_before_caret(&blocks, &caret).map(|(a, b, href)| (text.chars().skip(a).take(b - a).collect::<String>(), href))
+        };
+        for (typed, words) in [
+            ("see (https://a.test/x)", "https://a.test/x"),
+            ("see \"https://a.test/x\"", "https://a.test/x"),
+            ("see <www.a.test>", "www.a.test"),
+            ("see [https://a.test/x].", "https://a.test/x"),
+            ("see \u{201c}https://a.test/x\u{201d}", "https://a.test/x"),
+            ("see (https://a.test/x_(y))", "https://a.test/x_(y)"),
+        ] {
+            let found = at(typed, typed).unwrap_or_else(|| panic!("{typed}: an address"));
+            assert_eq!(found.0, words, "{typed}");
+        }
+        assert!(at("(", "(").is_none(), "nothing but the bracket");
+        // A picture before a typed address: its words for a screen reader are not counted, so
+        // the link that follows it is still seen as a link, and plain words after it are not.
+        let md = "![a long description](p.png) [https://b.test](https://b.test)";
+        let blocks = blocks(md);
+        let inline = InlineEdit::new(&blocks[0], true);
+        let text = inline.text().to_string();
+        let n = text.chars().count();
+        let caret =
+            Caret { block: 0, text: text.clone(), focus: true, selection: (n, n), place: Some(n), cell: None, span: None, inline: Some(inline) };
+        assert!(url_before_caret(&blocks, &caret).is_none(), "already a link: {text:?}");
+    }
+
     /// Issue #163: the Link dialog finds the link the caret is in, writes one that reads back as
     /// a link, and will not link to a script.
     #[test]
@@ -4387,6 +4638,28 @@ mod tests {
         for bad in ["", "  ", "javascript:alert(1)", "JavaScript:x", "data:text/html,x", "vbscript:x", "a\nb"] {
             assert!(!linkable_address(bad), "{bad:?}");
         }
+    }
+
+    /// Issue #540: a web address typed then followed by a space becomes a link, its display
+    /// text kept, with trailing punctuation left out of the link and literal in code.
+    #[test]
+    fn a_typed_web_address_becomes_a_link_when_a_space_follows() {
+        let typed = "see https://example.test/a. ";
+        let end = typed.chars().count();
+        let mut caret =
+            Caret { block: 0, text: typed.to_string(), focus: true, selection: (end, end), place: None, cell: None, span: None, inline: None };
+        let mut block = blocks("see https://example.test/a.").remove(0);
+        assert!(autolink_typed(&mut caret, &block), "the address before the space is linked");
+
+        caret.write(&mut block);
+        let Block::Paragraph(spans, _) = &block else { panic!("a paragraph") };
+        let linked: Vec<_> = spans.iter().filter(|s| s.link.is_some()).collect();
+        assert_eq!(linked.len(), 1, "one link: {spans:?}");
+        assert_eq!(linked[0].text, "https://example.test/a", "the period stays out of the link");
+        assert_eq!(linked[0].link.as_deref(), Some("https://example.test/a"));
+
+        let mut plain = Caret { text: "no space yet https://example.test".into(), selection: (33, 33), ..caret.clone() };
+        assert!(!autolink_typed(&mut plain, &block), "nothing happens until a space is typed");
     }
 
     /// Issue #165: the Format Painter picks up the formatting at the caret and puts exactly that

@@ -3406,7 +3406,8 @@ fn opening_a_page_in_a_second_window_preserves_unread_marks_from_the_first() {
     let first = sample.html_page;
     let other = sample.md_page;
     app.open_path(&first.to_string_lossy());
-    let mut child = app.child_window(&notecraft_ui_egui::windows::Request { path: other.clone(), quick: false }).expect("second window");
+    let mut child =
+        app.child_window(&notecraft_ui_egui::windows::Request { path: other.clone(), quick: false, docked: false }).expect("second window");
     let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 900.0));
     settle(&mut h);
     h.get_by_label("History").click();
@@ -10061,6 +10062,18 @@ fn the_size_list_opens_under_the_size_box() {
     let item = h.get_by_label("16").rect();
     assert!((item.min.x - boxed.min.x).abs() < 8.0, "the list is left-aligned with the size box: box {boxed:?}, list {item:?}");
     assert!(item.min.y >= boxed.max.y - 1.0, "the list is below the size box: box {boxed:?}, list {item:?}");
+    // Issue #506: only as wide as the box and its arrow, not out to the window's edge.
+    let arrow = h.get_by_label("Font Size").rect();
+    assert!(item.width() <= arrow.max.x - boxed.min.x + 2.0, "the list is the box's width: box {boxed:?}, arrow {arrow:?}, list {item:?}");
+    // The family list is a list of names, not a strip across the window.
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    h.get_by_label("Font Family").click();
+    // Its rows show each family in its own font, read in the background.
+    h.run_steps(12);
+    let widest =
+        h.query_all_by_role(egui::accesskit::Role::Button).filter(|n| n.rect().min.y > boxed.max.y).map(|n| n.rect().width()).fold(0.0, f32::max);
+    assert!(widest < 400.0, "the family list stays narrow: {widest}");
 }
 
 /// The size box shows the size of the text under the caret, as OneNote's does.
@@ -14286,7 +14299,8 @@ fn window_capture_keeps_conflicting_unsaved_edits_as_a_separate_page() {
         let (_t, mut first, sample) = sample_app("window-conflicts");
         let page = if html { &sample.html_page } else { &sample.md_page };
         first.open_path(&page.to_string_lossy());
-        let mut second = first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false }).expect("second");
+        let mut second =
+            first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false, docked: false }).expect("second");
         first.set_body(if html { "<p>first view</p>" } else { "first view\n" });
         second.set_body(if html { "<p>second view</p>" } else { "second view\n" });
         first.save();
@@ -14308,7 +14322,8 @@ fn window_capture_keeps_conflicting_unsaved_edits_as_a_separate_page() {
 fn window_capture_clean_view_reloads_changes_and_missing_pages_keep_unsaved_input() {
     let (_t, mut first, sample) = sample_app("window-reload");
     first.open_path(&sample.html_page.to_string_lossy());
-    let mut second = first.child_window(&notecraft_ui_egui::windows::Request { path: sample.html_page.clone(), quick: false }).expect("second");
+    let mut second =
+        first.child_window(&notecraft_ui_egui::windows::Request { path: sample.html_page.clone(), quick: false, docked: false }).expect("second");
     first.set_body("<p>new shared words</p>");
     first.save();
     second.check_page_changes();
@@ -14330,7 +14345,7 @@ fn conflicted_second_view(name: &str, ink: bool, title: bool) -> (TempDir, Harne
     let (t, mut first, sample) = sample_app(name);
     let page = sample.html_page.clone();
     first.open_path(&page.to_string_lossy());
-    let second = first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false }).expect("second");
+    let second = first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false, docked: false }).expect("second");
     drop(first);
     let mut h = sized_harness(second, LIGHT, egui::vec2(1500.0, 900.0));
     settle(&mut h);
@@ -14417,7 +14432,7 @@ fn window_capture_refreshed_caret_uses_the_new_pages_formatting() {
         first.open_path(&page.to_string_lossy());
         first.set_body(if html { "<p>seed</p>" } else { "seed\n" });
         first.save();
-        let second = first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false }).expect("second");
+        let second = first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false, docked: false }).expect("second");
         let mut h = sized_harness(second, LIGHT, egui::vec2(1500.0, 900.0));
         settle(&mut h);
         ask(&mut h, "ui.caret", json!({"block":0})).expect("caret");
@@ -15288,17 +15303,31 @@ fn view_zoom_cluster_and_full_page_follow_the_page() {
     assert_eq!(after_fit, Some(format!("{fitted}%")), "the box shows the fitted zoom");
     // F11 takes the notebooks away and brings them back; the button says which.
     assert_eq!(is_on(&h, "Full Page View"), Some(false));
+    let page_top = h.state().page_rect().expect("page").top();
     h.key_press(egui::Key::F11);
     settle(&mut h);
     assert!(h.state().is_full_page(), "F11 gives the page the whole window");
+    // Issue #516: the ribbon folds to its tabs and gives the page its room too, with the page's
+    // own button there to leave Full Page View.
+    let v = look_at(&mut h);
+    assert_eq!(v.pointer("/ribbon/shown").and_then(Value::as_bool), Some(false), "the ribbon is folded: {}", v["ribbon"]);
+    assert_eq!(v.pointer("/ribbon/collapsed").and_then(Value::as_bool), Some(false), "without changing the choice made outside");
+    assert!(h.state().page_rect().expect("page").top() < page_top - 40.0, "the page moved up into the ribbon's room");
+    assert_eq!(is_on(&h, "Full page"), Some(true), "the page's own button shows the way out");
+    // A tab still shows its commands, over the page.
+    h.get_by_label("View").click();
+    settle(&mut h);
     assert_eq!(is_on(&h, "Full Page View"), Some(true));
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
     h.key_press(egui::Key::F11);
     settle(&mut h);
     assert!(!h.state().is_full_page(), "and F11 brings the notebooks back");
+    assert_eq!(look_at(&mut h).pointer("/ribbon/shown").and_then(Value::as_bool), Some(true), "and the ribbon");
     h.get_by_label("Full Page View").click();
     settle(&mut h);
     assert!(h.state().is_full_page(), "the button does the same");
-    h.get_by_label("Normal view").click();
+    h.get_by_label("Full page").click();
     settle(&mut h);
     assert!(!h.state().is_full_page());
 }
@@ -16982,7 +17011,8 @@ fn window_capture_follows_a_moved_page_and_can_recover_unsaved_edits() {
         let page = sample.md_page;
         let destination = sample.html_page.parent().expect("destination section").to_path_buf();
         first.open_path(&page.to_string_lossy());
-        let mut second = first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false }).expect("second view");
+        let mut second =
+            first.child_window(&notecraft_ui_egui::windows::Request { path: page.clone(), quick: false, docked: false }).expect("second view");
         if mode != "clean" {
             second.set_body("Unsaved second window\n");
         }
@@ -18515,6 +18545,21 @@ fn a_search_result_opens_with_its_words_selected_in_view() {
     assert_eq!(picked, "Distant Marker", "the words are selected, as written: {caret}");
     assert!(v.pointer("/page/scrolled").and_then(Value::as_f64).unwrap_or(0.0) > 200.0, "the page scrolled down to them: {v}");
     let _ = page;
+
+    // One long paragraph with the words at its end: the caret's line is shown, not the
+    // paragraph's middle.
+    let mut long = "Plenty of ordinary words to fill a very long paragraph indeed. ".repeat(400);
+    long.push_str("Then the Faraway Beacon at last.");
+    page_of(&mut h, &s, "One long paragraph", &long);
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    search_for(&mut h, "faraway beacon");
+    h.get_all_by_label_contains("One long paragraph (").next().expect("the result").click();
+    settle(&mut h);
+    let v = look_at(&mut h);
+    let words = h.state().page_rect().expect("the page's words");
+    let scrolled = v.pointer("/page/scrolled").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+    assert!(scrolled > words.height() * 0.7, "scrolled to the end of the paragraph, where the words are: {scrolled} of {}", words.height());
 }
 
 /// Issue #536: Ctrl+A takes the paragraph, again the note container it is in, and again the
@@ -18864,4 +18909,754 @@ fn the_page_list_can_be_on_the_right_in_the_tabs_layout() {
     h.get_by_label("Page list on the right").click();
     settle(&mut h);
     assert!(add_page_x(&h) < 700.0, "and back on the left");
+}
+
+/// Issues #566 and #567: the navigator has Quick Notes under the notebooks. Before the first
+/// Quick Note it says there are none and offers to make one; after, it opens the section they are
+/// kept in. File > Options chooses that section from the sections there are, says where new ones
+/// go, and goes back to the default; a chosen section that is gone is said to be gone.
+#[test]
+fn quick_notes_open_from_the_navigator_and_their_section_is_chosen_in_options() {
+    let (t, app, s) = sample_app("ui-quick-notes");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 900.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let row = |h: &mut Harness<'_, NoteCraftApp>| {
+        h.get_by_label("Open Quick Notes").click();
+        settle(h);
+        look_at(h)
+    };
+    // None made yet: the page area says so.
+    let v = row(&mut h);
+    assert!(v["page"].is_null(), "nothing else is left open: {}", v["page"]);
+    assert_eq!(h.query_all_by_label("No Quick Notes yet. The Quick Notes you make are kept here.").count(), 1);
+    assert!(h.query_all_by_label("New quick note").count() >= 1, "with a way to make one");
+
+    // One made, the way New Quick Note makes it: the row opens its section and the note.
+    let made = ask(&mut h, "engine.execute", json!({"command": "window.quick-note", "params": {}})).expect("quick note");
+    let made = PathBuf::from(made.as_str().or_else(|| made.pointer("/path").and_then(Value::as_str)).unwrap_or_default());
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let v = row(&mut h);
+    let open = v.pointer("/page/path").and_then(Value::as_str).unwrap_or_default().to_string();
+    assert!(open.starts_with("quick-notes/quick-notes/"), "the Quick Notes section's note is open: {open}");
+    assert!(made.ends_with(&open), "the note made: {made:?} {open}");
+
+    // Options: Ideas is chosen, and said.
+    h.state_mut().open_backstage_page("Options");
+    pump(&mut h);
+    assert_eq!(h.query_all_by_label("New Quick Notes go to the Quick Notes notebook.").count(), 1, "the default, said before any choice");
+    h.get_by_label("Quick Notes section").click();
+    h.run();
+    h.get_by_label("My Notebook > Ideas").click();
+    settle(&mut h);
+    let settings = || std::fs::read_to_string(t.path().join("settings.toml")).unwrap_or_default();
+    assert!(settings().contains("quick_notes_section = \"my-notebook/ideas\""), "{}", settings());
+    assert!(look_at(&mut h)["status"]["text"].as_str().unwrap_or_default().contains("My Notebook > Ideas"));
+    assert_eq!(h.query_all_by_label("New Quick Notes go to My Notebook > Ideas.").count(), 1, "and shown in Options");
+    // The next Quick Note goes there, and the navigator's Quick Notes goes there too; the note
+    // made before stays where it was.
+    let next = ask(&mut h, "engine.execute", json!({"command": "window.quick-note", "params": {}})).expect("quick note");
+    let next = PathBuf::from(next.as_str().or_else(|| next.pointer("/path").and_then(Value::as_str)).unwrap_or_default());
+    // Compared as the system names them: Windows may give one with a `\\?\` prefix.
+    let ideas = s.md_page.parent().and_then(|p| std::fs::canonicalize(p).ok());
+    assert_eq!(next.parent().and_then(|p| std::fs::canonicalize(p).ok()), ideas, "made in Ideas");
+    assert!(made.exists(), "the first stays where it was saved");
+    h.state_mut().close_backstage();
+    settle(&mut h);
+    let v = row(&mut h);
+    assert!(v.pointer("/page/path").and_then(Value::as_str).unwrap_or_default().starts_with("my-notebook/ideas/"), "{}", v["page"]);
+
+    // A chosen section that is gone.
+    Settings::at(t.path().join("settings.toml")).set("quick_notes_section", "my-notebook/gone").expect("set");
+    let v = row(&mut h);
+    assert!(v["status"]["text"].as_str().unwrap_or_default().contains("not there any more"), "{}", v["status"]);
+    // Back to the default.
+    h.state_mut().open_backstage_page("Options");
+    pump(&mut h);
+    assert!(h.query_all_by_label("The section chosen for Quick Notes is not there any more. Choose another in File > Options.").count() == 1);
+    h.get_by_label("Quick Notes section").click();
+    h.run();
+    h.query_all_by_label("The Quick Notes notebook").last().expect("the default").click();
+    settle(&mut h);
+    assert!(settings().contains("quick_notes_section = \"\""), "{}", settings());
+}
+
+/// Issue #519: a section can keep a template its new pages start from. Add page and the line
+/// between pages use it, in their own place; the pages already there are as they were; a saved
+/// template that is then removed gives a blank page, and says so; and it can be cleared.
+#[test]
+fn a_section_can_keep_a_template_for_its_new_pages() {
+    let (_t, mut app, s) = sample_app("ui-section-template");
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 950.0));
+    settle(&mut h);
+    let section = s.md_page.parent().expect("section").to_path_buf();
+    let before = std::fs::read_to_string(notecraft_store::tree::page_file(&s.md_page).expect("page").1).expect("read");
+    h.get_by_label("Insert").click();
+    settle(&mut h);
+    h.get_by_label("Page Templates").click();
+    settle(&mut h);
+    h.get_by_label("Template for new pages in this section").click();
+    h.run();
+    h.query_all_by_label("To Do List").last().expect("in the list").click();
+    settle(&mut h);
+    assert_eq!(notecraft_store::ops::default_template(&section).as_deref(), Some("builtin:to-do-list"));
+    assert!(look_at(&mut h)["status"]["text"].as_str().unwrap_or_default().contains("start from To Do List"));
+    // Add page.
+    ask(&mut h, "ui.key", json!({"key": "N", "ctrl": true})).expect("Ctrl+N");
+    settle(&mut h);
+    let v = look_at(&mut h);
+    assert_ne!(v.pointer("/page/path").and_then(Value::as_str), Some("my-notebook/ideas/format-ideas"), "a new page: {}", v["page"]);
+    let body = h.state().body().unwrap_or_default().to_string();
+    assert!(body.contains("This week") && body.contains("- [ ]"), "it starts from the template: {body}");
+    assert!(v["status"]["text"].as_str().unwrap_or_default().contains("To Do List"), "{}", v["status"]);
+    // The line between pages: the template, in that place.
+    let made = ask(
+        &mut h,
+        "engine.execute",
+        json!({"command": "node.create", "params": {"parent": section.to_string_lossy(), "kind": "page", "order": "1"}}),
+    )
+    .expect("page at the top");
+    let made = PathBuf::from(made.as_str().or_else(|| made.pointer("/path").and_then(Value::as_str)).unwrap_or_default());
+    let first = notecraft_store::tree::child_dirs(&section).into_iter().next().expect("a page");
+    assert_eq!(std::fs::canonicalize(&first).ok(), std::fs::canonicalize(&made).ok(), "first in the section, where it was asked for");
+    let text = std::fs::read_to_string(notecraft_store::tree::page_file(&made).expect("page").1).expect("read");
+    assert!(text.contains("This week"), "from the template: {text}");
+    let after = std::fs::read_to_string(notecraft_store::tree::page_file(&s.md_page).expect("page").1).expect("read");
+    assert_eq!(before, after, "the page already there is as it was");
+    // A subpage, made under a page of the section, starts from the section's template too.
+    let sub = ask(&mut h, "engine.execute", json!({"command": "node.create", "params": {"parent": s.md_page.to_string_lossy(), "kind": "page"}}))
+        .expect("subpage");
+    let sub = PathBuf::from(sub.as_str().or_else(|| sub.pointer("/path").and_then(Value::as_str)).unwrap_or_default());
+    let text = std::fs::read_to_string(notecraft_store::tree::page_file(&sub).expect("page").1).expect("read");
+    assert!(text.contains("This week"), "the subpage is from the template: {text}");
+    // Ctrl+N on that subpage makes another beside it, and says the section's template.
+    ask(&mut h, "ui.open", json!({"path": sub.to_string_lossy()})).expect("open the subpage");
+    settle(&mut h);
+    ask(&mut h, "ui.key", json!({"key": "N", "ctrl": true})).expect("Ctrl+N");
+    settle(&mut h);
+    let v = look_at(&mut h);
+    assert!(v["status"]["text"].as_str().unwrap_or_default().contains("To Do List"), "the subpage's section template is said: {}", v["status"]);
+    assert!(h.state().body().unwrap_or_default().contains("This week"));
+    // One with its own title is not.
+    let titled = ask(
+        &mut h,
+        "engine.execute",
+        json!({"command": "node.create", "params": {"parent": s.md_page.to_string_lossy(), "kind": "page", "title": "Own words"}}),
+    )
+    .expect("titled subpage");
+    let titled = PathBuf::from(titled.as_str().or_else(|| titled.pointer("/path").and_then(Value::as_str)).unwrap_or_default());
+    let text = std::fs::read_to_string(notecraft_store::tree::page_file(&titled).expect("page").1).expect("read");
+    assert!(!text.contains("This week"), "{text}");
+
+    // A saved template, then removed: a blank page, and a word about it.
+    let saved =
+        ask(&mut h, "engine.execute", json!({"command": "page.save_template", "params": {"path": s.md_page.to_string_lossy(), "name": "Gone soon"}}))
+            .expect("save");
+    let _ = saved;
+    ask(
+        &mut h,
+        "engine.execute",
+        json!({"command": "section.set_template", "params": {"path": section.to_string_lossy(), "template": "saved:gone-soon"}}),
+    )
+    .expect("set");
+    ask(&mut h, "engine.execute", json!({"command": "page.remove_template", "params": {"template": "saved:gone-soon"}})).expect("remove");
+    ask(&mut h, "ui.key", json!({"key": "N", "ctrl": true})).expect("Ctrl+N");
+    settle(&mut h);
+    let v = look_at(&mut h);
+    assert!(v["status"]["text"].as_str().unwrap_or_default().contains("not there any more"), "{}", v["status"]);
+    assert!(!h.state().body().unwrap_or_default().contains("This week"), "a blank page");
+    let shown = {
+        let node = h.get_by_label("Template for new pages in this section");
+        node.value().unwrap_or_default()
+    };
+    assert!(
+        shown.contains("A template no longer there") || h.query_all_by_label_contains("A template no longer there").count() >= 1,
+        "the pane says so too: {shown:?}"
+    );
+    // Cleared.
+    h.get_by_label("Template for new pages in this section").click();
+    h.run();
+    h.query_all_by_label("No template: blank pages").last().expect("in the list").click();
+    settle(&mut h);
+    assert_eq!(notecraft_store::ops::default_template(&section), None);
+}
+
+/// Issue #533: pages can be picked with Ctrl and Shift, by pointer or keyboard, the count said,
+/// and moved or copied in one go, in their order. A plain click puts the pick down.
+#[test]
+fn several_pages_are_picked_and_moved_together() {
+    let (_t, app, s) = sample_app("ui-pick-pages");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 900.0));
+    for title in ["Alpha page", "Beta page", "Gamma page", "Delta page"] {
+        page_of(&mut h, &s, title, &format!("{title} words"));
+    }
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let picked = |h: &mut Harness<'_, NoteCraftApp>| -> Vec<String> {
+        look_at(h)["pickedPages"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
+    };
+    // Ctrl+click picks Beta beside the page open; Shift+click runs from Beta to Delta.
+    h.get_by_label("Beta page").click_modifiers(egui::Modifiers::COMMAND);
+    settle(&mut h);
+    assert_eq!(picked(&mut h).len(), 2, "the page open and Beta: {:?}", picked(&mut h));
+    assert!(look_at(&mut h)["status"]["text"].as_str().unwrap_or_default().contains("Pages picked: 2"));
+    assert_eq!(look_at(&mut h).pointer("/page/title").and_then(Value::as_str), Some("Format ideas"), "the page open stays open");
+    h.get_by_label("Delta page").click_modifiers(egui::Modifiers::SHIFT);
+    settle(&mut h);
+    let now = picked(&mut h);
+    assert_eq!(now.len(), 4, "Beta through Delta, and the page open: {now:?}");
+    // From the keyboard: Ctrl+Space takes one back out.
+    h.get_by_label("Gamma page").focus();
+    h.step();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Space);
+    settle(&mut h);
+    let now = picked(&mut h);
+    assert_eq!(now.len(), 3, "Gamma put down: {now:?}");
+    assert!(!now.iter().any(|p| p.ends_with("gamma-page")));
+    // Shift runs from the page last clicked, and leaves down the page Ctrl put down.
+    h.get_by_label("Beta page").click_modifiers(egui::Modifiers::SHIFT);
+    settle(&mut h);
+    let now = picked(&mut h);
+    assert_eq!(now.len(), 3, "Gamma stays down: {now:?}");
+    assert!(!now.iter().any(|p| p.ends_with("gamma-page")));
+
+    // Move or Copy from one of them takes all three, to Projects, in their order.
+    let projects = s.html_page.parent().expect("Projects").to_path_buf();
+    h.state_mut().open_move_or_copy(&s.md_page.parent().expect("Ideas").join("beta-page"));
+    settle(&mut h);
+    assert_eq!(h.query_all_by_label("Move or copy the 3 pages picked to:").count(), 1, "the count is said");
+    h.get_by_label("Projects").click();
+    settle(&mut h);
+    h.query_all_by_label("Move").last().expect("Move").click();
+    settle(&mut h);
+    let titles: Vec<String> =
+        notecraft_store::tree::child_dirs(&projects).iter().filter_map(|d| notecraft_store::tree::read_node(d)).map(|n| n.title).collect();
+    let tail: Vec<&str> = titles.iter().rev().take(3).rev().map(String::as_str).collect();
+    assert_eq!(tail, ["Format ideas", "Beta page", "Delta page"], "moved together, in order: {titles:?}");
+    assert!(look_at(&mut h)["status"]["text"].as_str().unwrap_or_default().contains("Pages moved: 3"));
+    assert!(picked(&mut h).is_empty(), "and put down");
+    assert_eq!(look_at(&mut h).pointer("/page/title").and_then(Value::as_str), Some("Format ideas"), "the page open is open where it went");
+
+    // A subpage picked with its page goes with it, once.
+    let ideas = s.md_page.parent().expect("Ideas").to_path_buf();
+    ask(&mut h, "engine.execute", json!({"command": "node.demote", "params": {"path": ideas.join("gamma-page").to_string_lossy()}}))
+        .expect("subpage");
+    let gamma = notecraft_store::tree::child_dirs(&ideas.join("alpha-page")).into_iter().next().expect("Gamma under Alpha");
+    ask(&mut h, "ui.open", json!({"path": gamma.to_string_lossy()})).expect("open");
+    settle(&mut h);
+    h.get_by_label("Alpha page").click_modifiers(egui::Modifiers::COMMAND);
+    settle(&mut h);
+    assert_eq!(picked(&mut h).len(), 2, "Alpha and its subpage Gamma: {:?}", picked(&mut h));
+    h.state_mut().open_move_or_copy(&ideas.join("alpha-page"));
+    settle(&mut h);
+    h.get_by_label("Projects").click();
+    settle(&mut h);
+    h.query_all_by_label("Copy").last().expect("Copy").click();
+    settle(&mut h);
+    let copies: Vec<String> =
+        notecraft_store::tree::child_dirs(&projects).iter().filter_map(|d| notecraft_store::tree::read_node(d)).map(|n| n.title).collect();
+    assert_eq!(copies.iter().filter(|t| *t == "Alpha page").count(), 1, "{copies:?}");
+    assert!(!copies.iter().any(|t| t == "Gamma page"), "Gamma went inside Alpha, not beside it: {copies:?}");
+}
+
+/// Issue #539: the Link dialog finds a notebook, section or page by name; picking one makes a
+/// local link to it and fills in its name when there are no words yet; the link leads there;
+/// and a typed web address still works as before.
+#[test]
+fn the_link_dialog_links_to_a_place_in_the_notebooks() {
+    for html in [false, true] {
+        let (_t, app, s) = sample_app("ui-link-place");
+        let mut h = sized_harness(app, LIGHT, egui::vec2(1400.0, 900.0));
+        let page = if html { &s.html_page } else { &s.md_page };
+        notecraft_store::page::save_body(page, if html { "<p>start </p>" } else { "start " }).expect("fixture");
+        ask(&mut h, "ui.open", json!({"path": page.to_string_lossy()})).expect("open");
+        settle(&mut h);
+        ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+        settle(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "End"})).expect("end");
+        settle(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "K", "ctrl": true})).expect("Ctrl+K");
+        settle(&mut h);
+        h.get_by_label("Find a notebook, section or page").click();
+        settle(&mut h);
+        h.get_by_label("Find a notebook, section or page").type_text("deep");
+        settle(&mut h);
+        assert!(h.query_all_by_label_contains("Format ideas \u{b7} Page").next().is_none(), "html={html}: only the places with the words");
+        h.get_all_by_label_contains("Deep page \u{b7} Page").next().expect("row").click();
+        settle(&mut h);
+        h.get_by_label("OK").click();
+        settle(&mut h);
+        h.state_mut().save();
+        let body = notecraft_store::page::load_page(page).expect("load").body;
+        let start = body.find("notecraft:/").expect("a local link");
+        let address: String = body[start..].chars().take_while(|c| !matches!(c, ')' | '"' | ' ')).collect();
+        assert!(address.starts_with("notecraft:/my-notebook/work/projects/deep-page"), "html={html}: a local link: {body}");
+        let made = if html { format!("<a href=\"{address}\">Deep page</a>") } else { format!("[Deep page]({address})") };
+        assert!(body.contains(&made), "html={html}: named for the page it leads to: {body}");
+        // It leads there.
+        let root = s.notebook.parent().expect("the notebooks folder").to_path_buf();
+        let link = notecraft_store::links::resolve(&root, page, &address);
+        assert!(matches!(link, notecraft_store::links::Link::Node(ref p) if p.ends_with("deep-page")), "html={html}: {link:?}");
+    }
+}
+
+/// Issue #540: a web address typed in the page becomes a link when a space or a new line ends it,
+/// the words as typed and the sentence's full stop left out; www. addresses go to https; Undo
+/// takes the link off and keeps the words; and an address in code stays code. Both page formats.
+#[test]
+fn a_typed_web_address_becomes_a_link() {
+    for html in [false, true] {
+        let (_t, app, s) = sample_app("ui-autolink");
+        let mut h = sized_harness(app, LIGHT, egui::vec2(1400.0, 900.0));
+        let page = if html { &s.html_page } else { &s.md_page };
+        notecraft_store::page::save_body(page, if html { "<p>Read </p><pre><code>x</code></pre>" } else { "Read \n\n```\nx\n```\n" })
+            .expect("fixture");
+        ask(&mut h, "ui.open", json!({"path": page.to_string_lossy()})).expect("open");
+        settle(&mut h);
+        ask(&mut h, "ui.caret", json!({"block": 0})).expect("caret");
+        settle(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "End"})).expect("end");
+        settle(&mut h);
+        ask(&mut h, "ui.text", json!({"text": " https://example.test/a_b."})).expect("type");
+        settle(&mut h);
+        ask(&mut h, "ui.text", json!({"text": " "})).expect("space");
+        settle(&mut h);
+        ask(&mut h, "ui.text", json!({"text": "and www.example.org"})).expect("type");
+        settle(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "Enter"})).expect("Enter");
+        settle(&mut h);
+        h.state_mut().save();
+        let body = notecraft_store::page::load_page(page).expect("load").body;
+        let (first, second) = if html {
+            ("<a href=\"https://example.test/a_b\">https://example.test/a_b</a>.", "<a href=\"https://www.example.org\">www.example.org</a>")
+        } else {
+            ("[https://example.test/a_b](https://example.test/a_b).", "[www.example.org](https://www.example.org)")
+        };
+        assert!(body.contains(&format!("Read {first}")), "html={html}: the address is a link, the full stop is not: {body}");
+        assert!(body.contains(second), "html={html}: www. goes to https: {body}");
+        // Undo takes the last link off and leaves its words.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        settle(&mut h);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        settle(&mut h);
+        h.state_mut().save();
+        let body = notecraft_store::page::load_page(page).expect("load").body;
+        assert!(body.contains("www.example.org") && !body.contains("https://www.example.org"), "html={html}: Undo took the link off: {body}");
+
+        // In a code block an address stays as it is.
+        let v = look_at(&mut h);
+        let blocks = v.pointer("/page/blocks").and_then(Value::as_u64).unwrap_or(0) as usize;
+        ask(&mut h, "ui.caret", json!({"block": blocks - 1})).expect("caret in the code");
+        settle(&mut h);
+        ask(&mut h, "ui.key", json!({"key": "End"})).expect("end");
+        settle(&mut h);
+        ask(&mut h, "ui.text", json!({"text": " https://code.test "})).expect("type");
+        settle(&mut h);
+        h.state_mut().save();
+        let body = notecraft_store::page::load_page(page).expect("load").body;
+        assert!(
+            body.contains("https://code.test") && !body.contains("(https://code.test)") && !body.contains("href=\"https://code.test"),
+            "html={html}: {body}"
+        );
+    }
+}
+
+/// Issue #527: search results can be pinned beside the page. They keep their query, scope and
+/// the result opened while the pages are opened and edited, a result opens its page at the words
+/// found, and the pane closes when asked; the popup works as before.
+#[test]
+fn search_results_can_be_pinned_beside_the_page() {
+    let (_t, app, s) = sample_app("ui-pinned-search");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1600.0, 900.0));
+    page_of(&mut h, &s, "Level notes", "Level ground for every notebook.");
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    search_for(&mut h, "Level");
+    let found = look_at(&mut h).pointer("/search/hits").and_then(Value::as_array).map_or(0, Vec::len);
+    assert!(found >= 2, "results to pin: {found}");
+    h.get_by_label("Pin results").click();
+    settle(&mut h);
+    let v = look_at(&mut h);
+    assert_eq!(v.pointer("/pinnedSearch/query").and_then(Value::as_str), Some("Level"), "{}", v["pinnedSearch"]);
+    assert_eq!(v.pointer("/pinnedSearch/hits").and_then(Value::as_u64), Some(found as u64));
+    assert_eq!(v.pointer("/search/query").and_then(Value::as_str), Some(""), "the popup is put away");
+    assert!(h.query_all_by_label_contains("in All notebooks").count() >= 1, "the query and scope are shown");
+    // Open one, then another: the pane stays, with the one opened marked.
+    h.get_all_by_label_contains("Level notes (").next().expect("a pinned row").click();
+    settle(&mut h);
+    let v = look_at(&mut h);
+    assert_eq!(v.pointer("/page/title").and_then(Value::as_str), Some("Level notes"));
+    assert!(v.pointer("/page/caret/text").and_then(Value::as_str).unwrap_or_default().contains("Level ground"), "at the words found: {}", v["page"]);
+    let first = v.pointer("/pinnedSearch/chosen").and_then(Value::as_u64);
+    assert!(first.is_some(), "the result opened is marked");
+    // Edit the page: the pane is as it was.
+    ask(&mut h, "ui.text", json!({"text": "x"})).expect("type");
+    settle(&mut h);
+    assert_eq!(look_at(&mut h).pointer("/pinnedSearch/chosen").and_then(Value::as_u64), first, "kept while the page is edited");
+    h.get_all_by_label_contains("Level 1 (").next().or_else(|| h.get_all_by_label_contains("Deep page (").next()).expect("another row").click();
+    settle(&mut h);
+    let v = look_at(&mut h);
+    assert_ne!(v.pointer("/page/title").and_then(Value::as_str), Some("Level notes"), "another page opened");
+    assert_ne!(v.pointer("/pinnedSearch/chosen").and_then(Value::as_u64), first);
+    assert_eq!(v.pointer("/pinnedSearch/query").and_then(Value::as_str), Some("Level"), "the query is kept");
+    h.get_by_label("Close").click();
+    settle(&mut h);
+    assert!(look_at(&mut h)["pinnedSearch"].is_null(), "closed when asked");
+}
+
+/// Draws one stroke across the page from (x, y), 80 points to the right, with the pen in hand.
+fn draw_across(h: &mut Harness<'_, NoteCraftApp>, x: f32, y: f32) {
+    ask(h, "ui.press", json!({"x": x, "y": y})).expect("down");
+    pump(h);
+    for step in 1..=8 {
+        ask(h, "ui.move", json!({"x": x + step as f32 * 20.0, "y": y})).expect("move");
+        pump(h);
+    }
+    ask(h, "ui.release", json!({"x": x + 160.0, "y": y})).expect("up");
+    pump(h);
+    settle(h);
+}
+
+/// Issue #544: ink picked up turns a quarter either way and mirrors either way from Draw >
+/// Rotate, as one group about its middle; it stays picked up; Undo stroke and Redo stroke take
+/// the turn back and put it back; and it is saved turned.
+#[test]
+fn held_ink_is_turned_and_mirrored_from_the_draw_tab() {
+    let (_t, mut app, s) = sample_app("ui-ink-rotate");
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = harness(app, LIGHT);
+    settle(&mut h);
+    h.get_by_label("Draw").click();
+    h.run();
+    h.get_by_label("Pen black").click();
+    h.run();
+    let body = h.state().page_rect().expect("the page");
+    let (x, y) = (body.min.x + 40.0, body.min.y + 160.0);
+    draw_across(&mut h, x, y);
+    let ink = |h: &mut Harness<'_, NoteCraftApp>| look_at(h)["ink"].clone();
+    let size = |v: &Value| {
+        let b: Vec<f64> = v["bounds"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+        (b[2] - b[0], b[3] - b[1], (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+    };
+    assert_eq!(ink(&mut h)["strokes"].as_u64(), Some(1), "{}", ink(&mut h));
+    let (w0, h0, cx0, cy0) = size(&ink(&mut h));
+    assert!(w0 > 100.0 && h0 < 20.0, "a line across: {w0} x {h0}");
+    assert_eq!(h.query_all_by_label("Rotate").count(), 0, "nothing held, nothing to turn");
+    h.get_by_label("Select").click();
+    pump(&mut h);
+    ask(&mut h, "ui.click", json!({"x": x + 80.0, "y": y})).expect("pick");
+    settle(&mut h);
+    assert_eq!(ink(&mut h)["holding"].as_u64(), Some(1));
+    h.get_by_label("Rotate").click();
+    h.run();
+    h.get_by_label("Rotate Right 90°").click();
+    settle(&mut h);
+    let (w1, h1, cx1, cy1) = size(&ink(&mut h));
+    assert!(h1 > 100.0 && w1 < 20.0, "turned on end: {w1} x {h1}");
+    assert!((cx1 - cx0).abs() < 2.0 && (cy1 - cy0).abs() < 2.0, "about its middle");
+    assert_eq!(ink(&mut h)["holding"].as_u64(), Some(1), "still picked up");
+    assert!(h.state().status().contains("turned"), "{}", h.state().status());
+    // Mirrored top to bottom: still on end, the same place.
+    h.get_by_label("Rotate").click();
+    h.run();
+    h.get_by_label("Flip Vertical").click();
+    settle(&mut h);
+    let (w2, h2, ..) = size(&ink(&mut h));
+    assert!(h2 > 100.0 && w2 < 20.0);
+    // Undo stroke takes each change back, one at a time; Redo stroke puts it back.
+    h.get_by_label("Undo stroke").click();
+    settle(&mut h);
+    h.get_by_label("Undo stroke").click();
+    settle(&mut h);
+    let (w3, h3, ..) = size(&ink(&mut h));
+    assert!(w3 > 100.0 && h3 < 20.0, "back across: {w3} x {h3}");
+    assert_eq!(ink(&mut h)["strokes"].as_u64(), Some(1), "the stroke itself stays");
+    h.get_by_label("Redo stroke").click();
+    settle(&mut h);
+    // Saved turned: away and back.
+    ask(&mut h, "ui.open", json!({"path": s.html_page.to_string_lossy()})).expect("away");
+    settle(&mut h);
+    ask(&mut h, "ui.open", json!({"path": s.md_page.to_string_lossy()})).expect("back");
+    settle(&mut h);
+    let (w4, h4, ..) = size(&ink(&mut h));
+    assert!(h4 > 100.0 && w4 < 20.0, "saved turned: {w4} x {h4}");
+}
+
+/// Issue #545: the eraser's menu offers Small, Medium and Large erasers that rub out only the
+/// ink under them, cutting a stroke in two, and the Stroke Eraser that takes the whole stroke.
+/// The one in hand is said and remembered, and one rub is one step for undo.
+#[test]
+fn the_eraser_rubs_out_points_or_whole_strokes() {
+    let (t, mut app, s) = sample_app("ui-eraser-sizes");
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = harness(app, LIGHT);
+    settle(&mut h);
+    h.get_by_label("Draw").click();
+    h.run();
+    h.get_by_label("Pen black").click();
+    h.run();
+    let body = h.state().page_rect().expect("the page");
+    let (x, y) = (body.min.x + 40.0, body.min.y + 160.0);
+    draw_across(&mut h, x, y);
+    let ink = |h: &mut Harness<'_, NoteCraftApp>| look_at(h)["ink"].clone();
+    assert_eq!(ink(&mut h)["strokes"].as_u64(), Some(1));
+    assert_eq!(ink(&mut h)["eraser"].as_str(), Some("stroke"), "the eraser it always was");
+    h.get_by_label("Eraser").click();
+    h.run();
+    h.get_by_label("Eraser options").click();
+    h.run();
+    for name in ["Small Eraser", "Medium Eraser", "Large Eraser", "Stroke Eraser"] {
+        assert_eq!(h.query_all_by_label(name).count(), 1, "{name} is offered");
+    }
+    h.get_by_label("Medium Eraser").click();
+    settle(&mut h);
+    assert_eq!(ink(&mut h)["eraser"].as_str(), Some("medium"));
+    assert_eq!(ink(&mut h)["pointer"].as_str(), Some("erase"));
+    let rub = |h: &mut Harness<'_, NoteCraftApp>, at: f32| {
+        ask(h, "ui.press", json!({"x": at, "y": y})).expect("down");
+        pump(h);
+        ask(h, "ui.move", json!({"x": at + 1.0, "y": y})).expect("move");
+        pump(h);
+        ask(h, "ui.release", json!({"x": at + 1.0, "y": y})).expect("up");
+        pump(h);
+        settle(h);
+    };
+    rub(&mut h, x + 80.0);
+    assert_eq!(ink(&mut h)["strokes"].as_u64(), Some(2), "cut in two where it was rubbed: {}", ink(&mut h));
+    h.get_by_label("Undo stroke").click();
+    settle(&mut h);
+    assert_eq!(ink(&mut h)["strokes"].as_u64(), Some(1), "one rub, one step back");
+    // The Stroke Eraser, from the eraser's own menu on a right click: the whole stroke goes.
+    h.get_by_label("Eraser").click_secondary();
+    h.run();
+    h.get_by_label("Stroke Eraser").click();
+    settle(&mut h);
+    rub(&mut h, x + 80.0);
+    assert_eq!(ink(&mut h)["strokes"].as_u64(), Some(0), "the whole stroke: {}", ink(&mut h));
+    let settings = std::fs::read_to_string(t.path().join("settings.toml")).unwrap_or_default();
+    assert!(settings.contains("eraser = \"stroke\""), "{settings}");
+    // Remembered: the medium one, in a new window.
+    h.get_by_label("Eraser options").click();
+    h.run();
+    h.get_by_label("Large Eraser").click();
+    settle(&mut h);
+    let again = NoteCraftApp::new(session(&t));
+    let mut h2 = harness(again, LIGHT);
+    h2.run();
+    assert_eq!(look_at(&mut h2)["ink"]["eraser"].as_str(), Some("large"));
+}
+
+/// Issue #554: View > New Docked Window opens the page in a second window that docks itself to
+/// the side of the screen once its screen is known, and leaves the first window as it was.
+#[test]
+fn a_new_docked_window_docks_itself_and_leaves_this_one_alone() {
+    let (_t, mut app, s) = sample_app("ui-new-docked");
+    app.open_path(&s.md_page.to_string_lossy());
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 900.0));
+    settle(&mut h);
+    h.get_by_label("View").click();
+    settle(&mut h);
+    h.get_by_label("New docked window").click();
+    settle(&mut h);
+    let requests = h.state_mut().take_window_requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].docked && !requests[0].quick, "a docked window was asked for");
+    assert_eq!(requests[0].path, s.md_page);
+    assert!(!h.state().is_docked(), "this window stays as it was");
+    let child = h.state().child_window(&requests[0]).expect("the second window");
+    let mut c = sized_harness(child, LIGHT, egui::vec2(1100.0, 760.0));
+    c.run_steps(2);
+    assert!(!c.state().is_docked(), "not before its screen is known");
+    if let Some(root) = c.input_mut().viewports.get_mut(&egui::ViewportId::ROOT) {
+        root.monitor_size = Some(egui::vec2(1920.0, 1080.0));
+        root.outer_rect = Some(egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(1100.0, 760.0)));
+        root.inner_rect = Some(egui::Rect::from_min_size(egui::pos2(100.0, 80.0), egui::vec2(1100.0, 730.0)));
+    }
+    let commands = steps_with_commands(&mut c);
+    settle(&mut c);
+    assert!(c.state().is_docked(), "{}", c.state().status());
+    assert!(commands.iter().any(|cmd| cmd.contains("AlwaysOnTop")), "{commands:?}");
+    assert_eq!(c.state().current_page(), Some(s.md_page.as_path()), "on the same page");
+    // A plain New window is not docked.
+    h.get_by_label("View").click();
+    settle(&mut h);
+    h.get_by_label("New window").click();
+    settle(&mut h);
+    let requests = h.state_mut().take_window_requests();
+    assert!(requests.iter().all(|r| !r.docked));
+}
+
+/// Issue #517: a section's menu has Merge into Another Section. Its pages go into the section
+/// picked, after the pages there and in their order, with their subpages; the page open is
+/// opened where it went; the emptied section goes, and a copy of it is in the recycle bin.
+#[test]
+fn a_section_is_merged_into_another_from_its_menu() {
+    let (_t, app, s) = sample_app("ui-merge-section");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 900.0));
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    let ideas = s.md_page.parent().expect("Ideas").to_path_buf();
+    let projects = s.html_page.parent().expect("Projects").to_path_buf();
+    let titles = |dir: &std::path::Path| -> Vec<String> {
+        notecraft_store::tree::child_dirs(dir).iter().filter_map(|d| notecraft_store::tree::read_node(d)).map(|n| n.title).collect()
+    };
+    let moving = titles(&ideas);
+    let before = titles(&projects);
+    assert!(!moving.is_empty());
+    // A page held by Copy before the merge.
+    h.get_all_by_label("Format ideas").next().expect("page row").click_secondary();
+    settle(&mut h);
+    h.query_all_by_label("Copy").last().expect("Copy on the page's menu").click();
+    settle(&mut h);
+    h.get_all_by_label("Ideas").next().expect("section row").click_secondary();
+    settle(&mut h);
+    h.get_by_label("Merge into Another Section…").click();
+    settle(&mut h);
+    assert_eq!(h.query_all_by_label("Merge the pages of Ideas into:").count(), 1);
+    h.query_all_by_label("Projects").last().expect("Projects in the list").click();
+    settle(&mut h);
+    h.query_all_by_label("Merge").last().expect("Merge").click();
+    settle(&mut h);
+    assert!(!ideas.exists(), "the emptied section is gone");
+    let after = titles(&projects);
+    assert_eq!(after.len(), before.len() + moving.len(), "{after:?}");
+    assert_eq!(&after[before.len()..], moving.as_slice(), "after the pages there, in their order");
+    let v = look_at(&mut h);
+    assert!(v["status"]["text"].as_str().unwrap_or_default().contains("Pages moved"), "{}", v["status"]);
+    assert_eq!(v.pointer("/page/title").and_then(Value::as_str), Some("Format ideas"), "the page open is open where it went");
+    assert!(v.pointer("/page/path").and_then(Value::as_str).unwrap_or_default().contains("projects"), "{}", v["page"]);
+    let notebook = ideas.parent().expect("notebook");
+    let bin = notecraft_store::recycle::list(notebook).expect("bin");
+    assert!(bin.iter().any(|r| r.title == "Ideas"), "a copy in the recycle bin: {bin:?}");
+    // The page held is held where it went: pasting it makes a copy.
+    h.get_all_by_label("Projects").next().expect("section row").click_secondary();
+    settle(&mut h);
+    h.get_by_label("Paste page").click();
+    settle(&mut h);
+    assert!(!h.state().status().contains("no longer there"), "{}", h.state().status());
+    assert_eq!(titles(&projects).iter().filter(|t| *t == "Format ideas").count(), 2, "{:?}", titles(&projects));
+}
+
+/// Issue #526: Find on this page lights every place the words are, says which of how many is
+/// current, F3 and Shift+F3 (and Next and Previous) go round them, the words can be changed in
+/// the bar, and Escape closes it with the caret on the current place, its words picked.
+#[test]
+fn find_on_this_page_lights_and_goes_through_every_place() {
+    let (_t, app, s) = sample_app("ui-find-on-page");
+    let mut h = sized_harness(app, LIGHT, egui::vec2(1500.0, 900.0));
+    notecraft_store::page::save_body(
+        &s.md_page,
+        "First parity marker here.\n\nA **parity** marker in bold, and another parity\nmarker after it.\n\n| Col | Note |\n|---|---|\n| a | parity marker |\n\nNothing to see.\n",
+    )
+    .expect("fixture");
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    search_for(&mut h, "parity marker");
+    h.get_all_by_label("Find on this page").next().expect("the scope").click();
+    settle(&mut h);
+    h.get_by_label_contains("Format ideas (My Notebook > Ideas)").click();
+    settle(&mut h);
+    let find = |h: &mut Harness<'_, NoteCraftApp>| look_at(h)["pageFind"].clone();
+    let f = find(&mut h);
+    assert_eq!(f["count"].as_u64(), Some(4), "across bold, a line break and in a table cell: {f}");
+    assert_eq!(f["current"].as_u64(), Some(0));
+    assert!(h.query_all_by_label("1 of 4").count() >= 1, "the bar says which of how many");
+    assert!(look_at(&mut h).pointer("/page/caret").is_none_or(Value::is_null), "the caret is put down while finding");
+    for want in [1, 2, 3, 0] {
+        ask(&mut h, "ui.key", json!({"key": "F3"})).expect("F3");
+        settle(&mut h);
+        assert_eq!(find(&mut h)["current"].as_u64(), Some(want), "F3 goes round");
+    }
+    ask(&mut h, "ui.key", json!({"key": "F3", "shift": true})).expect("Shift+F3");
+    settle(&mut h);
+    assert_eq!(find(&mut h)["current"].as_u64(), Some(3), "Shift+F3 goes back round");
+    h.get_by_label("Next Match").click();
+    settle(&mut h);
+    assert_eq!(find(&mut h)["current"].as_u64(), Some(0));
+    h.get_by_label("Previous Match").click();
+    settle(&mut h);
+    assert_eq!(find(&mut h)["current"].as_u64(), Some(3));
+    assert!(h.query_all_by_label("4 of 4").count() >= 1);
+    // Escape on the place in the table: the caret in its cell.
+    let in_table = find(&mut h)["found"][3].clone();
+    assert_eq!(in_table[3], json!([1, 1]), "in the cell it is in: {in_table}");
+    ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("Escape");
+    settle(&mut h);
+    let caret = look_at(&mut h).pointer("/page/caret").cloned().unwrap_or(Value::Null);
+    assert_eq!((caret["block"].clone(), caret["cell"].clone()), (in_table[0].clone(), json!([1, 1])), "{caret}");
+    ask(&mut h, "ui.key", json!({"key": "F3"})).expect("F3 opens it again");
+    settle(&mut h);
+    for _ in 0..2 {
+        h.get_by_label("Next Match").click();
+        settle(&mut h);
+    }
+    assert_eq!(find(&mut h)["current"].as_u64(), Some(2));
+    // Escape: the caret on the current place, its words picked.
+    let found = find(&mut h)["found"][2].clone();
+    ask(&mut h, "ui.key", json!({"key": "Escape"})).expect("Escape");
+    settle(&mut h);
+    let v = look_at(&mut h);
+    assert!(v["pageFind"].is_null(), "closed");
+    let caret = v.pointer("/page/caret").cloned().unwrap_or(Value::Null);
+    assert_eq!(caret["block"], found[0], "{caret} at {found}");
+    let (a, b) = (caret["anchor"].as_u64().unwrap_or(0), caret["at"].as_u64().unwrap_or(0));
+    assert_eq!((a.min(b), a.max(b)), (found[1].as_u64().unwrap_or(0), found[2].as_u64().unwrap_or(0)), "its words picked: {caret}");
+    // Other words, typed in the bar.
+    ask(&mut h, "ui.key", json!({"key": "F3"})).expect("F3 opens it again");
+    settle(&mut h);
+    assert_eq!(find(&mut h)["count"].as_u64(), Some(4));
+    let field = h.get_by_label("Find on page:");
+    field.focus();
+    h.run();
+    ask(&mut h, "ui.key", json!({"key": "A", "ctrl": true})).expect("all");
+    settle(&mut h);
+    ask(&mut h, "ui.text", json!({"text": "bold"})).expect("type");
+    settle(&mut h);
+    assert_eq!(find(&mut h)["count"].as_u64(), Some(1), "{}", find(&mut h));
+    ask(&mut h, "ui.text", json!({"text": "zzz"})).expect("type");
+    settle(&mut h);
+    assert_eq!(find(&mut h)["count"].as_u64(), Some(0));
+    assert!(h.query_all_by_label("No matches on this page").count() >= 1);
+    h.get_by_label("Close Find").click();
+    settle(&mut h);
+    assert!(find(&mut h).is_null());
+}
+
+/// Issue #526: with the find bar's field focused, a paste goes into the field, once, and never
+/// into the page, however the paste arrives.
+#[test]
+fn a_paste_in_the_find_bar_goes_into_its_field_and_not_the_page() {
+    let board = MemoryBoard::new();
+    let (_t, app, s) = sample_app("ui-find-paste");
+    let mut h = sized_harness(app.with_clipboard(Box::new(board.clone())), LIGHT, egui::vec2(1500.0, 900.0));
+    notecraft_store::page::save_body(&s.md_page, "Some words here.\n\nMore words.\n").expect("fixture");
+    h.state_mut().open_path(&s.md_page.to_string_lossy());
+    settle(&mut h);
+    search_for(&mut h, "words");
+    h.get_all_by_label("Find on this page").next().expect("the scope").click();
+    settle(&mut h);
+    h.get_by_label_contains("Format ideas (My Notebook > Ideas)").click();
+    settle(&mut h);
+    let before = h.state().body().expect("page body").to_owned();
+    for path in ["key-only", "queued", "queued-with-event"] {
+        h.get_by_label("Find on page:").focus();
+        h.run();
+        ask(&mut h, "ui.key", json!({"key": "A", "ctrl": true})).expect("select the field");
+        pump(&mut h);
+        board.put_text("More");
+        if path == "key-only" {
+            ask(&mut h, "ui.key", json!({"key": "V", "ctrl": true})).expect("Ctrl+V");
+        } else {
+            h.state_mut().queue_keyboard_paste();
+            if path == "queued-with-event" {
+                h.event(egui::Event::Paste("More".into()));
+            }
+        }
+        settle(&mut h);
+        assert_eq!(h.state().body().expect("page body"), before, "{path} pasted into the page");
+        assert_eq!(look_at(&mut h)["pageFind"]["words"].as_str(), Some("More"), "{path}: into the field, once");
+        assert_eq!(look_at(&mut h)["pageFind"]["count"].as_u64(), Some(1));
+    }
 }
